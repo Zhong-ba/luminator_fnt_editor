@@ -5,8 +5,9 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from PyQt6.QtCore import Qt, QSize, QTimer, QSettings, QEvent, pyqtSignal
-from PyQt6.QtGui import QAction, QFont, QPainter, QColor, QPen, QImage
+from PyQt6.QtCore import Qt, QSize, QPoint, QTimer, QSettings, QEvent, QByteArray, pyqtSignal
+from PyQt6.QtGui import QAction, QFont, QPainter, QColor, QPen, QImage, QIcon, QPixmap
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -15,6 +16,33 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QHeaderView, QInputDialog, QDialog, QDialogButtonBox,
     QLineEdit, QFormLayout, QStyledItemDelegate, QStyle
 )
+
+_UNDO_SVG = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+     stroke="#F8FAFC" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <polyline points="9 14 4 9 9 4"></polyline>
+  <path d="M20 20v-7a4 4 0 0 0-4-4H4"></path>
+</svg>
+"""
+
+_REDO_SVG = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+     stroke="#F8FAFC" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <polyline points="15 14 20 9 15 4"></polyline>
+  <path d="M4 20v-7a4 4 0 0 1 4-4h12"></path>
+</svg>
+"""
+
+
+def _svg_icon(svg_text, size=18):
+    """Rasterize an inline SVG string into a QIcon at the given pixel size."""
+    renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pixmap)
 
 class LuminatorFont:
     # In the supplied Luminator files the offset table begins at byte 28.
@@ -525,6 +553,7 @@ class LuminatorFont:
 class PixelCanvas(QWidget):
     changed = pyqtSignal()
     changeStarted = pyqtSignal()
+    selectionChanged = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -535,6 +564,10 @@ class PixelCanvas(QWidget):
         self.cell_size = self.base_cell_size
         self.paint_value = None
         self.last_cell = None
+
+        # Hover/press tracking purely for visual feedback while painting.
+        self.hover_cell = None
+        self.active_cells = set()
 
         # Selection / move state.
         # Right-drag creates a rectangular selection. Left-dragging from
@@ -562,12 +595,16 @@ class PixelCanvas(QWidget):
     def set_font_model(self, model):
         self.font_model = model
         self.glyph_index = 0
+        self.hover_cell = None
+        self.active_cells = set()
         self.clear_selection()
         self.update_geometry()
         self.update()
 
     def set_glyph_index(self, idx):
         self.glyph_index = idx
+        self.hover_cell = None
+        self.active_cells = set()
         self.clear_selection()
         self.update_geometry()
         self.update()
@@ -610,6 +647,10 @@ class PixelCanvas(QWidget):
 
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
+        # Individual pixel hover/press feedback is only shown while there is
+        # no active selection box, per requirement 2.
+        show_pixel_feedback = self.selection is None
+
         for y in range(rows):
             for x in range(cols):
                 cell_x = x * self.cell_size
@@ -620,6 +661,13 @@ class PixelCanvas(QWidget):
                 painter.setPen(QPen(cell_border, 1))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(cell_x, cell_y, self.cell_size, self.cell_size)
+
+                if show_pixel_feedback and (x, y) in self.active_cells:
+                    painter.setBrush(QColor(59, 130, 246, 90))
+                    painter.drawRect(cell_x + 1, cell_y + 1, self.cell_size - 2, self.cell_size - 2)
+                elif show_pixel_feedback and (x, y) == self.hover_cell:
+                    painter.setBrush(QColor(148, 163, 184, 45))
+                    painter.drawRect(cell_x + 1, cell_y + 1, self.cell_size - 2, self.cell_size - 2)
 
                 # Circular LED dot.
                 painter.setPen(Qt.PenStyle.NoPen)
@@ -639,9 +687,27 @@ class PixelCanvas(QWidget):
             w = (right - left + 1) * self.cell_size
             h = (bottom - top + 1) * self.cell_size
 
-            painter.setBrush(QColor(59, 130, 246, 28))
-            selection_pen = QPen(QColor("#60A5FA"), 2)
-            selection_pen.setStyle(Qt.PenStyle.DashLine)
+            hovering_selection = (
+                self.hover_cell is not None
+                and not self.selecting
+                and self._cell_in_selection(self.hover_cell)
+            )
+
+            if self.moving_selection:
+                fill = QColor(59, 130, 246, 80)
+                border = QColor("#93C5FD")
+            elif hovering_selection:
+                fill = QColor(59, 130, 246, 50)
+                border = QColor("#7DB6FA")
+            else:
+                fill = QColor(59, 130, 246, 28)
+                border = QColor("#60A5FA")
+
+            painter.setBrush(fill)
+            selection_pen = QPen(border, 2)
+            selection_pen.setStyle(
+                Qt.PenStyle.SolidLine if self.moving_selection else Qt.PenStyle.DashLine
+            )
             painter.setPen(selection_pen)
             painter.drawRect(x + 1, y + 1, max(1, w - 2), max(1, h - 2))
 
@@ -660,9 +726,11 @@ class PixelCanvas(QWidget):
         x, y = cell
         self.font_model.set_pixel(self.glyph_index, x, y, self.paint_value)
         self.last_cell = cell
+        self.active_cells.add(cell)
         self.update()
 
     def clear_selection(self):
+        had_selection = self.selection is not None
         self.selection = None
         self.selection_anchor = None
         self.selecting = False
@@ -672,6 +740,8 @@ class PixelCanvas(QWidget):
         self.move_original_bitmap = None
         self.move_current_delta = (0, 0)
         self.update()
+        if had_selection:
+            self.selectionChanged.emit()
 
     def _normalized_selection(self, a, b):
         if a is None or b is None:
@@ -751,6 +821,7 @@ class PixelCanvas(QWidget):
 
         self.move_current_delta = (dx, dy)
         self.update()
+        self.selectionChanged.emit()
 
     def mousePressEvent(self, event):
         if not self.font_model:
@@ -771,10 +842,18 @@ class PixelCanvas(QWidget):
             self.paint_value = None
             self.last_cell = None
             self.update()
+            self.selectionChanged.emit()
             event.accept()
             return
 
-        if event.button() != Qt.MouseButton.LeftButton or cell is None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        # Clicking outside the pixel grid entirely just cancels any selection.
+        if cell is None:
+            if self.selection is not None:
+                self.clear_selection()
+            event.accept()
             return
 
         # Left-drag from inside a selection: move the selected pixels.
@@ -787,22 +866,31 @@ class PixelCanvas(QWidget):
             self.move_current_delta = (0, 0)
             self.paint_value = None
             self.last_cell = None
+            self.update()
             event.accept()
             return
 
-        # Clicking outside an existing selection returns to paint mode.
+        # Clicking an unselected pixel while a selection is active only
+        # cancels the selection; it must not also toggle that pixel.
         if self.selection is not None:
             self.clear_selection()
+            event.accept()
+            return
 
         self.changeStarted.emit()
         x, y = cell
         self.paint_value = not self.font_model.pixel(self.glyph_index, x, y)
         self.last_cell = None
+        self.active_cells = set()
         self._paint_cell(cell)
         event.accept()
 
     def mouseMoveEvent(self, event):
         cell = self._cell_from_pos(event.position())
+
+        if cell != self.hover_cell:
+            self.hover_cell = cell
+            self.update()
 
         # Update rectangular right-drag selection.
         if self.selecting and (event.buttons() & Qt.MouseButton.RightButton):
@@ -811,6 +899,7 @@ class PixelCanvas(QWidget):
                     self.selection_anchor, cell
                 )
                 self.update()
+                self.selectionChanged.emit()
             event.accept()
             return
 
@@ -860,6 +949,12 @@ class PixelCanvas(QWidget):
         if event.buttons() & Qt.MouseButton.LeftButton:
             self._paint_cell(cell)
 
+    def leaveEvent(self, event):
+        if self.hover_cell is not None:
+            self.hover_cell = None
+            self.update()
+        super().leaveEvent(event)
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton and self.selecting:
             self.selecting = False
@@ -884,8 +979,10 @@ class PixelCanvas(QWidget):
         had_paint = self.paint_value is not None
         self.paint_value = None
         self.last_cell = None
+        self.active_cells = set()
         if had_paint:
             self.changed.emit()
+            self.update()
 
 
 class CharacterMapDelegate(QStyledItemDelegate):
@@ -948,6 +1045,9 @@ class MainWindow(QMainWindow):
         self._restoring_history = False
         self._imported_from_signmatrix = False
         self._new_from_scratch = False
+        self._selected_codes = []
+        self._confirmed_save_paths = set()
+        self.clipboard = None
 
         # Each file/folder dialog remembers its own last-used location.
         # QSettings keeps these paths across application restarts.
@@ -969,7 +1069,7 @@ class MainWindow(QMainWindow):
         toolbar.setIconSize(QSize(18, 18))
         self.addToolBar(toolbar)
 
-        new_action = QAction("New Font", self)
+        new_action = QAction("New", self)
         new_action.setShortcut("Ctrl+N")
         new_action.setToolTip("Create a blank Luminator FNT font from scratch")
         new_action.triggered.connect(self.create_new_font)
@@ -980,10 +1080,15 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self.open_file)
         toolbar.addAction(open_action)
 
-        save_action = QAction("Save As", self)
-        save_action.setShortcut("Ctrl+Shift+S")
-        save_action.triggered.connect(self.save_as)
+        save_action = QAction("Save", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self.save)
         toolbar.addAction(save_action)
+
+        save_as_action = QAction("Save As", self)
+        save_as_action.setShortcut("Ctrl+Shift+S")
+        save_as_action.triggered.connect(self.save_as)
+        toolbar.addAction(save_as_action)
 
         toolbar.addSeparator()
 
@@ -1057,7 +1162,7 @@ class MainWindow(QMainWindow):
         self.char_table.horizontalHeader().setVisible(False)
         self.char_table.verticalHeader().setVisible(False)
         self.char_table.setShowGrid(False)
-        self.char_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.char_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.char_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.char_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.char_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -1066,7 +1171,7 @@ class MainWindow(QMainWindow):
         self.char_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
-        self.char_table.cellClicked.connect(self.character_cell_clicked)
+        self.char_table.itemSelectionChanged.connect(self.character_selection_changed)
         self.char_table.setFixedHeight(250)
         self._char_columns = 1
         self._char_cell_min_width = 28
@@ -1173,14 +1278,18 @@ class MainWindow(QMainWindow):
         self.glyph_title.setObjectName("EditorTitle")
         header_row.addWidget(self.glyph_title)
 
-        self.undo_btn = QPushButton("Undo")
+        self.undo_btn = QPushButton()
         self.undo_btn.setObjectName("CompactButton")
+        self.undo_btn.setIcon(_svg_icon(_UNDO_SVG))
+        self.undo_btn.setIconSize(QSize(18, 18))
         self.undo_btn.setToolTip("Undo (Ctrl+Z)")
         self.undo_btn.clicked.connect(self.undo)
         header_row.addWidget(self.undo_btn)
 
-        self.redo_btn = QPushButton("Redo")
+        self.redo_btn = QPushButton()
         self.redo_btn.setObjectName("CompactButton")
+        self.redo_btn.setIcon(_svg_icon(_REDO_SVG))
+        self.redo_btn.setIconSize(QSize(18, 18))
         self.redo_btn.setToolTip("Redo (Ctrl+Y)")
         self.redo_btn.clicked.connect(self.redo)
         header_row.addWidget(self.redo_btn)
@@ -1215,13 +1324,74 @@ class MainWindow(QMainWindow):
         self.canvas = PixelCanvas()
         self.canvas.changeStarted.connect(self._begin_history_action)
         self.canvas.changed.connect(self._canvas_change_finished)
+        self.canvas.selectionChanged.connect(self._update_selection_actions_bar)
+        self.canvas.installEventFilter(self)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(False)
         self.scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scroll.setWidget(self.canvas)
         self.scroll.setObjectName("CanvasScroll")
+        self.scroll.viewport().installEventFilter(self)
+        self.scroll.installEventFilter(self)
         editor_layout.addWidget(self.scroll, 1)
+
+        # Floating buttons overlaid on top of the canvas viewport. Copy/Paste
+        # are always available; Set Lit/Unlit only apply to a selection.
+        self.selection_actions_bar = QWidget(self.scroll)
+        self.selection_actions_bar.setObjectName("SelectionActionsBar")
+        self.selection_actions_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        selection_actions_layout = QHBoxLayout(self.selection_actions_bar)
+        selection_actions_layout.setContentsMargins(10, 6, 10, 6)
+        selection_actions_layout.setSpacing(8)
+
+        self.copy_btn = QPushButton("Copy")
+        self.copy_btn.setObjectName("SelectionActionButton")
+        self.copy_btn.setToolTip("Copy the selection (or the whole glyph if nothing is selected)")
+        self.copy_btn.clicked.connect(self.copy_pixels)
+        selection_actions_layout.addWidget(self.copy_btn)
+
+        self.paste_btn = QPushButton("Paste")
+        self.paste_btn.setObjectName("SelectionActionButton")
+        self.paste_btn.setToolTip("Paste into the selection (or the top-left corner if nothing is selected)")
+        self.paste_btn.clicked.connect(self.paste_pixels)
+        selection_actions_layout.addWidget(self.paste_btn)
+
+        self.mirror_h_btn = QPushButton("Mirror H")
+        self.mirror_h_btn.setObjectName("SelectionActionButton")
+        self.mirror_h_btn.setToolTip(
+            "Flip the selection (or the whole glyph if nothing is selected) left-to-right"
+        )
+        self.mirror_h_btn.clicked.connect(lambda: self.mirror_pixels("horizontal"))
+        selection_actions_layout.addWidget(self.mirror_h_btn)
+
+        self.mirror_v_btn = QPushButton("Mirror V")
+        self.mirror_v_btn.setObjectName("SelectionActionButton")
+        self.mirror_v_btn.setToolTip(
+            "Flip the selection (or the whole glyph if nothing is selected) top-to-bottom"
+        )
+        self.mirror_v_btn.clicked.connect(lambda: self.mirror_pixels("vertical"))
+        selection_actions_layout.addWidget(self.mirror_v_btn)
+
+        self.set_lit_btn = QPushButton("Set Lit")
+        self.set_lit_btn.setObjectName("SelectionActionButton")
+        self.set_lit_btn.setToolTip("Turn every pixel in the selection on")
+        self.set_lit_btn.clicked.connect(lambda: self.set_selection_pixels(True))
+        selection_actions_layout.addWidget(self.set_lit_btn)
+
+        self.set_unlit_btn = QPushButton("Set Unlit")
+        self.set_unlit_btn.setObjectName("SelectionActionButton")
+        self.set_unlit_btn.setToolTip("Turn every pixel in the selection off")
+        self.set_unlit_btn.clicked.connect(lambda: self.set_selection_pixels(False))
+        selection_actions_layout.addWidget(self.set_unlit_btn)
+
+        self.selection_actions_bar.setVisible(False)
+
+        self.multi_select_label = QLabel("Multiple characters selected")
+        self.multi_select_label.setObjectName("MultiSelectLabel")
+        self.multi_select_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.multi_select_label.setVisible(False)
+        editor_layout.addWidget(self.multi_select_label, 1)
 
         main.addWidget(editor_panel, 1)
 
@@ -1379,7 +1549,7 @@ class MainWindow(QMainWindow):
             }
 
             #CompactButton {
-                min-width: 46px;
+                min-width: 40px;
                 max-width: 54px;
                 padding: 6px 8px;
                 text-align: center;
@@ -1395,6 +1565,23 @@ class MainWindow(QMainWindow):
             #HintLabel {
                 color: #94A3B8;
                 font-size: 12px;
+            }
+
+            #MultiSelectLabel {
+                color: #94A3B8;
+                font-size: 16px;
+                font-weight: 600;
+            }
+
+            #SelectionActionsBar {
+                background: rgba(17, 24, 39, 235);
+                border: 1px solid #334155;
+                border-radius: 10px;
+            }
+
+            #SelectionActionButton {
+                text-align: center;
+                padding: 6px 12px;
             }
 
             #CharacterTable {
@@ -2258,7 +2445,7 @@ finally {
             ch = chr(code)
             display = ch
             if code == 0x20:
-                display = "␠"
+                display = ""
             elif ch.isspace():
                 display = "·"
 
@@ -2289,7 +2476,243 @@ finally {
                 if new_columns != getattr(self, "_char_columns", 1):
                     # Defer rebuilding until Qt finishes the current resize pass.
                     QTimer.singleShot(0, self._rebuild_character_table)
+
+        if (
+            hasattr(self, "scroll")
+            and obj is self.scroll.viewport()
+            and event.type() == QEvent.Type.MouseButtonPress
+        ):
+            # A press reaching the viewport (rather than the canvas widget)
+            # landed on the blank margin around the glyph, not on a pixel.
+            if self.canvas.selection is not None:
+                self.canvas.clear_selection()
+
+        if (
+            hasattr(self, "scroll")
+            and event.type() == QEvent.Type.Resize
+            and obj in (self.scroll, self.scroll.viewport(), self.canvas)
+        ):
+            # Defer until Qt finishes laying out the resize/maximize/snap
+            # pass, otherwise mapTo() can read stale intermediate geometry.
+            QTimer.singleShot(0, self._position_selection_actions_bar)
+
         return super().eventFilter(obj, event)
+
+    def _position_selection_actions_bar(self):
+        """Keep the floating action bar centered above the canvas, clamped to
+        the visible viewport so it never drifts when the canvas is larger
+        than the viewport or the window is resized.
+        """
+        if not hasattr(self, "selection_actions_bar"):
+            return
+        bar = self.selection_actions_bar
+        bar.adjustSize()
+
+        viewport = self.scroll.viewport()
+        viewport_origin = viewport.mapTo(self.scroll, QPoint(0, 0))
+        canvas_origin = self.canvas.mapTo(self.scroll, QPoint(0, 0))
+
+        canvas_center_x = canvas_origin.x() + self.canvas.width() // 2
+        x = canvas_center_x - bar.width() // 2
+
+        min_x = viewport_origin.x()
+        max_x = max(min_x, viewport_origin.x() + viewport.width() - bar.width())
+        x = max(min_x, min(x, max_x))
+
+        bar.move(x, viewport_origin.y() + 10)
+        bar.raise_()
+
+    def _update_selection_actions_bar(self):
+        if not hasattr(self, "selection_actions_bar"):
+            return
+        has_model = bool(self.model)
+        self.selection_actions_bar.setVisible(has_model)
+        if has_model:
+            self._position_selection_actions_bar()
+
+        selection_active = has_model and self.canvas.selection is not None
+        self.set_lit_btn.setEnabled(selection_active)
+        self.set_unlit_btn.setEnabled(selection_active)
+        self.copy_btn.setEnabled(has_model)
+        self.paste_btn.setEnabled(has_model and self.clipboard is not None)
+        self.mirror_h_btn.setEnabled(has_model)
+        self.mirror_v_btn.setEnabled(has_model)
+
+    def set_selection_pixels(self, value):
+        """Set every pixel in the active selection box to lit/unlit."""
+        if not self.model or self.canvas.selection is None:
+            return
+
+        left, top, right, bottom = self.canvas.selection
+        idx = self.canvas.glyph_index
+
+        self._begin_history_action()
+        for y in range(top, bottom + 1):
+            for x in range(left, right + 1):
+                self.model.set_pixel(idx, x, y, value)
+        self._commit_history_action()
+
+        self.canvas.update()
+        code = self.model.first + idx
+        self._update_character_item_style(code)
+        self.mark_dirty()
+
+    def copy_pixels(self):
+        """Copy the selection, or the whole glyph when nothing is selected."""
+        if not self.model:
+            return
+
+        idx = self.canvas.glyph_index
+        if self.canvas.selection is not None:
+            left, top, right, bottom = self.canvas.selection
+        else:
+            left, top = 0, 0
+            right = self.model.width(idx) - 1
+            bottom = self.model.height - 1
+
+        rows = [
+            [self.model.pixel(idx, x, y) for x in range(left, right + 1)]
+            for y in range(top, bottom + 1)
+        ]
+        self.clipboard = {
+            "width": right - left + 1,
+            "height": bottom - top + 1,
+            "rows": rows,
+        }
+        self._update_selection_actions_bar()
+        self.statusBar().showMessage(
+            f"Copied {self.clipboard['width']}x{self.clipboard['height']} pixels", 2500
+        )
+
+    def mirror_pixels(self, axis):
+        """Flip the selection, or the whole glyph if nothing is selected."""
+        if not self.model:
+            return
+
+        idx = self.canvas.glyph_index
+        if self.canvas.selection is not None:
+            left, top, right, bottom = self.canvas.selection
+        else:
+            left, top = 0, 0
+            right = self.model.width(idx) - 1
+            bottom = self.model.height - 1
+
+        rows = [
+            [self.model.pixel(idx, x, y) for x in range(left, right + 1)]
+            for y in range(top, bottom + 1)
+        ]
+        flipped = [row[::-1] for row in rows] if axis == "horizontal" else rows[::-1]
+
+        self._begin_history_action()
+        self._paste_rows(
+            idx, flipped, right - left + 1, bottom - top + 1, origin_x=left, origin_y=top
+        )
+        self._commit_history_action()
+
+        self.canvas.update()
+        code = self.model.first + idx
+        self._update_character_item_style(code)
+        self.mark_dirty()
+        label = "left-right" if axis == "horizontal" else "top-bottom"
+        self.statusBar().showMessage(f"Mirrored {label}", 2500)
+
+    def _paste_rows(self, idx, rows, max_w, max_h, origin_x=0, origin_y=0):
+        """Blit clipboard rows at (origin_x, origin_y), clipped to max_w/max_h."""
+        for sy, row in enumerate(rows):
+            if sy >= max_h:
+                break
+            for sx, value in enumerate(row):
+                if sx >= max_w:
+                    break
+                self.model.set_pixel(idx, origin_x + sx, origin_y + sy, value)
+
+    def paste_pixels(self):
+        """Paste clipboard pixels into the selection, or the top-left corner."""
+        if not self.model or not self.clipboard:
+            return
+
+        idx = self.canvas.glyph_index
+        clip_w = self.clipboard["width"]
+        clip_h = self.clipboard["height"]
+        rows = self.clipboard["rows"]
+
+        # With an active selection, the paste is always clipped to that box
+        # and starts at its top-left corner; the glyph itself never resizes.
+        if self.canvas.selection is not None:
+            left, top, right, bottom = self.canvas.selection
+            sel_w = right - left + 1
+            sel_h = bottom - top + 1
+
+            self._begin_history_action()
+            self._paste_rows(idx, rows, sel_w, sel_h, origin_x=left, origin_y=top)
+            self._commit_history_action()
+
+            self.canvas.update()
+            code = self.model.first + idx
+            self._update_character_item_style(code)
+            self.mark_dirty()
+            self.statusBar().showMessage("Pasted into selection", 2500)
+            return
+
+        width = self.model.width(idx)
+        height = self.model.height
+
+        if clip_w <= width and clip_h <= height:
+            self._begin_history_action()
+            self._paste_rows(idx, rows, width, height)
+            self._commit_history_action()
+
+            self.canvas.update()
+            code = self.model.first + idx
+            self._update_character_item_style(code)
+            self.mark_dirty()
+            self.statusBar().showMessage("Pasted", 2500)
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Paste exceeds glyph size")
+        box.setText(
+            f"The copied pixels are {clip_w}x{clip_h}, but this glyph is only "
+            f"{width}x{height}.\n\nWiden the glyph to fit the paste, or paste "
+            "into the existing area (pixels outside the glyph are dropped)?"
+        )
+        widen_btn = box.addButton("Widen && Paste", QMessageBox.ButtonRole.AcceptRole)
+        clip_btn = box.addButton("Paste As-Is", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(widen_btn)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is widen_btn:
+            self._begin_history_action()
+            new_height = max(height, clip_h)
+            if new_height != height:
+                self.model.resize_height(new_height)
+            new_width = max(width, clip_w)
+            for _ in range(new_width - width):
+                self.model.add_column(idx, "right")
+            self._paste_rows(idx, rows, new_width, new_height)
+            self._commit_history_action()
+
+            self.canvas.update_geometry()
+            self.canvas.update()
+            code = self.model.first + idx
+            self._update_character_item_style(code)
+            self.refresh_metrics()
+            self.mark_dirty()
+            if not self.manual_scale_override:
+                QTimer.singleShot(0, self.auto_fit_canvas)
+            self.statusBar().showMessage("Widened glyph and pasted", 2500)
+        elif clicked is clip_btn:
+            self._begin_history_action()
+            self._paste_rows(idx, rows, width, height)
+            self._commit_history_action()
+
+            self.canvas.update()
+            code = self.model.first + idx
+            self._update_character_item_style(code)
+            self.mark_dirty()
+            self.statusBar().showMessage("Pasted (clipped to glyph size)", 2500)
 
     def _load_model_into_editor(self, display_name):
         """Populate all editor controls from self.model."""
@@ -2320,6 +2743,7 @@ finally {
             self._select_character_code(self.model.first)
 
         self.refresh_metrics()
+        self._update_selection_actions_bar()
         QTimer.singleShot(0, self.auto_fit_canvas)
 
     def create_new_font(self):
@@ -2499,6 +2923,41 @@ finally {
         self._load_model_into_editor(self.current_path.name)
         self.statusBar().showMessage(f"Opened {self.current_path.name}")
 
+    def save(self):
+        if not self.model:
+            return
+
+        # No real FNT path yet (new/imported font), so fall back to Save As.
+        if self.current_path is None or self._imported_from_signmatrix or self._new_from_scratch:
+            self.save_as()
+            return
+
+        path_key = str(self.current_path)
+        if path_key not in self._confirmed_save_paths:
+            reply = QMessageBox.question(
+                self,
+                "Save file",
+                f"Save changes to {self.current_path.name}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            self._confirmed_save_paths.add(path_key)
+
+        try:
+            self.model.save(str(self.current_path))
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+            return
+
+        self.dirty = False
+        title = "Luminator FNT Pixel Editor"
+        if self.current_path:
+            title += f" — {self.current_path.name}"
+        self.setWindowTitle(title)
+        self.statusBar().showMessage(f"Saved {self.current_path.name}", 5000)
+
     def save_as(self):
         if not self.model:
             return
@@ -2530,8 +2989,12 @@ finally {
         self.current_path = Path(path)
         self._imported_from_signmatrix = False
         self._new_from_scratch = False
+        self._confirmed_save_paths.add(str(self.current_path))
         self.filename_label.setText(self.current_path.name)
         self.dirty = False
+        title = "Luminator FNT Pixel Editor"
+        title += f" — {self.current_path.name}"
+        self.setWindowTitle(title)
         self.statusBar().showMessage(f"Saved {Path(path).name}", 5000)
 
     def _select_character_code(self, code):
@@ -2550,13 +3013,40 @@ finally {
         if not self.manual_scale_override:
             QTimer.singleShot(0, self.auto_fit_canvas)
 
-    def character_cell_clicked(self, row, col):
-        item = self.char_table.item(row, col)
-        if not item:
+    def character_selection_changed(self):
+        if not self.model:
             return
-        code = item.data(Qt.ItemDataRole.UserRole)
-        if code is not None:
-            self._select_character_code(int(code))
+
+        codes = sorted(
+            {
+                int(item.data(Qt.ItemDataRole.UserRole))
+                for item in self.char_table.selectedItems()
+                if item.data(Qt.ItemDataRole.UserRole) is not None
+            }
+        )
+        self._selected_codes = codes
+        multi = len(codes) > 1
+
+        self.scroll.setVisible(not multi)
+        self.multi_select_label.setVisible(multi)
+
+        for btn in (
+            self.add_left_col_btn,
+            self.add_right_col_btn,
+            self.remove_left_col_btn,
+            self.remove_right_col_btn,
+            self.add_glyph_btn,
+        ):
+            btn.setEnabled(not multi)
+
+        if multi:
+            self.selected_char_label.setText(f"{len(codes)} selected")
+            self.refresh_metrics()
+            self.statusBar().showMessage(f"{len(codes)} characters selected", 2500)
+            return
+
+        if codes:
+            self._select_character_code(codes[0])
 
     def manual_scale_changed(self, value):
         self.scale_value_label.setText(f"{value}%")
@@ -2641,6 +3131,14 @@ finally {
         super().resizeEvent(event)
         if not self.manual_scale_override:
             QTimer.singleShot(0, self.auto_fit_canvas)
+        QTimer.singleShot(0, self._position_selection_actions_bar)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # Maximize/restore/snap can settle the window's final geometry a
+        # tick after this event, so defer the reposition like resizeEvent does.
+        if event.type() == QEvent.Type.WindowStateChange:
+            QTimer.singleShot(0, self._position_selection_actions_bar)
 
     def _snapshot_state(self):
         if not self.model:
@@ -2957,6 +3455,10 @@ finally {
         if not self.model:
             return
 
+        if len(self._selected_codes) > 1:
+            self._remove_glyph_multi(self._selected_codes)
+            return
+
         idx = self.canvas.glyph_index
         code = self.model.first + idx
         ch = chr(code)
@@ -3021,6 +3523,11 @@ finally {
     def clear_glyph(self):
         if not self.model:
             return
+
+        if len(self._selected_codes) > 1:
+            self._clear_glyph_multi(self._selected_codes)
+            return
+
         idx = self.canvas.glyph_index
         reply = QMessageBox.question(
             self,
@@ -3041,6 +3548,87 @@ finally {
         self._update_character_item_style(code)
         self.mark_dirty()
 
+    def _clear_glyph_multi(self, codes):
+        reply = QMessageBox.question(
+            self,
+            "Clear glyphs",
+            f"Clear every pixel in the {len(codes)} selected glyphs?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._begin_history_action()
+        for code in codes:
+            if self.model.first <= code <= self.model.last:
+                idx = code - self.model.first
+                self.model.glyphs[idx] = bytearray(len(self.model.glyphs[idx]))
+        self.canvas.clear_selection()
+        self.canvas.update()
+        self._commit_history_action()
+
+        for code in codes:
+            self._update_character_item_style(code)
+        self.mark_dirty()
+        self.statusBar().showMessage(f"Cleared {len(codes)} glyphs", 2500)
+
+    def _remove_glyph_multi(self, codes):
+        reply = QMessageBox.question(
+            self,
+            "Remove glyphs",
+            f"Remove the {len(codes)} selected characters?\n\n"
+            "Characters at the edge of the font's character range will be removed "
+            "entirely; characters inside the range will be cleared to blank instead, "
+            "because Luminator FNT requires one contiguous character range.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        remaining = set(codes)
+        self._begin_history_action()
+
+        # Peel edge codes off the range one at a time; whatever is left after
+        # the range can no longer shrink around it gets cleared instead.
+        progressed = True
+        while progressed and remaining:
+            progressed = False
+            if self.model.count > 1 and self.model.first in remaining:
+                old_first = self.model.first
+                ok, _ = self.model.remove_edge_glyph(old_first)
+                if ok:
+                    remaining.discard(old_first)
+                    progressed = True
+                    continue
+            if self.model.count > 1 and self.model.last in remaining:
+                old_last = self.model.last
+                ok, _ = self.model.remove_edge_glyph(old_last)
+                if ok:
+                    remaining.discard(old_last)
+                    progressed = True
+                    continue
+
+        for code in remaining:
+            if self.model.first <= code <= self.model.last:
+                idx = code - self.model.first
+                self.model.glyphs[idx] = bytearray(len(self.model.glyphs[idx]))
+
+        self._commit_history_action()
+
+        new_code = min(self.model.last, max(self.model.first, codes[0]))
+        self._rebuild_character_table(select_code=new_code)
+        self.canvas.set_glyph_index(new_code - self.model.first)
+        self._select_character_code(new_code)
+        self.canvas.update_geometry()
+        self.canvas.update()
+        self.mark_dirty()
+        self.refresh_metrics()
+
+        if not self.manual_scale_override:
+            QTimer.singleShot(0, self.auto_fit_canvas)
+
     def mark_dirty(self):
         if not self.model:
             return
@@ -3057,6 +3645,16 @@ finally {
             self.height_value.setEnabled(False)
             self.width_value.setText("—")
             self.bytes_value.setText("—")
+            return
+
+        if len(self._selected_codes) > 1:
+            self.height_value.blockSignals(True)
+            self.height_value.setEnabled(True)
+            self.height_value.setValue(self.model.height)
+            self.height_value.blockSignals(False)
+            self.width_value.setText("—")
+            self.bytes_value.setText(str(self.model.bytes_per_col))
+            self.glyph_title.setText(f"Pixel Editor · {len(self._selected_codes)} selected")
             return
 
         idx = self.canvas.glyph_index
