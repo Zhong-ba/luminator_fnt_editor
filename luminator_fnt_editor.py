@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from PyQt6.QtCore import Qt, QSize, QPoint, QTimer, QSettings, QEvent, QByteArray, pyqtSignal
-from PyQt6.QtGui import QAction, QFont, QPainter, QColor, QPen, QImage, QIcon, QPixmap
+from PyQt6.QtGui import QAction, QCursor, QFont, QPainter, QColor, QPen, QImage, QIcon, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QSpinBox, QToolBar, QStatusBar, QFrame, QSizePolicy, QScrollArea,
     QGroupBox, QGridLayout, QTableWidget, QTableWidgetItem, QSlider,
     QAbstractItemView, QHeaderView, QInputDialog, QDialog, QDialogButtonBox,
-    QLineEdit, QFormLayout, QStyledItemDelegate, QStyle
+    QLineEdit, QFormLayout, QStyledItemDelegate, QStyle, QMenu, QToolButton
 )
 
 _UNDO_SVG = """
@@ -196,6 +196,121 @@ class LuminatorFont:
 
         blank = bytearray(glyph_width * obj.bytes_per_col)
         obj.glyphs = [bytearray(blank) for _ in range(obj.count)]
+        return obj
+
+    @classmethod
+    def from_bbm(cls, path, custom_order=False):
+        """Import the known Axion BBM bitmap-font layouts as an editable FNT model."""
+        path = Path(path)
+        raw = path.read_bytes()
+
+        # Axion BBM uses fixed-size glyph slots. The slot width includes one
+        # width byte followed by padded column data; the 10/11-pixel fonts
+        # store two bytes per column.
+        layouts = {
+            666: (18, 6, 108, 5, 1),
+            888: (24, 8, 108, 7, 1),
+            1221: (22, 11, 109, 10, 2),
+            1665: (15, 15, 110, 14, 2),
+            1887: (17, 17, 110, 16, 2),
+            2109: (19, 19, 110, 18, 2),
+            2775: (25, 25, 110, 24, 2),
+        }
+        try:
+            header_size, slot_size, count, max_width, bytes_per_column = layouts[len(raw)]
+        except KeyError as e:
+            raise ValueError(
+                f"Unsupported BBM size ({len(raw)} bytes). "
+                "This importer supports the observed Axion BBM layouts only."
+            ) from e
+
+        if header_size + slot_size * count != len(raw):
+            raise ValueError("BBM payload does not match its expected glyph-slot layout.")
+
+        match = re.search(r"x(\d+)", path.stem, re.IGNORECASE)
+        if match:
+            height = int(match.group(1))
+        elif path.stem.upper() == "F-DIGITAL":
+            height = 8
+        else:
+            raise ValueError(
+                "Could not determine the BBM glyph height from its filename "
+                "(expected a name such as F-DF5x7N.BBM)."
+            )
+        if not 1 <= height <= bytes_per_column * 8:
+            raise ValueError("BBM height and byte layout do not agree.")
+
+        # The 110-slot large layouts begin with "!". The original 109-slot
+        # 10/11-pixel family begins with a quote, while the short 108-slot
+        # layouts begin with "#".
+        first = 0x21 if count == 110 else 0x22 if height >= 10 else 0x23
+        last = first + count - 1
+        spacing = 2 if height >= 10 else 1
+        obj = cls.create_blank(path.stem, height, spacing, first, last, 1)
+        obj.path = path
+        obj.raw = raw
+        obj.bytes_per_col = bytes_per_column
+        obj.glyphs = []
+
+        bit_offset = bytes_per_column * 8 - height
+
+        for index in range(count):
+            start = header_size + index * slot_size
+            slot = raw[start:start + slot_size]
+            encoded_width = slot[0]
+            if encoded_width > max_width:
+                raise ValueError(
+                    f"BBM glyph {index} declares width {encoded_width}, "
+                    f"outside the supported range 0-{max_width}."
+                )
+            if bytes_per_column == 2 and encoded_width % 2:
+                raise ValueError(
+                    f"BBM glyph {index} has an odd two-byte-column width "
+                    f"({encoded_width})."
+                )
+            width = max(1, (encoded_width + bytes_per_column - 1) // bytes_per_column)
+            column_bytes = slot[1:1 + encoded_width]
+            glyph = bytearray(width * bytes_per_column)
+
+            # BBM stores each column as a packed integer. Short fonts use one
+            # byte per column; 10/11-pixel fonts use a big-endian 16-bit value.
+            # The useful bitmap starts at a format-specific bit offset.
+            for x in range(width):
+                for y in range(height):
+                    column_start = x * bytes_per_column
+                    column_data = column_bytes[column_start:column_start + bytes_per_column]
+                    column_value = int.from_bytes(column_data, "big")
+                    if column_value & (1 << (bit_offset + y)):
+                        target_y = height - 1 - y
+                        target_chunk = bytes_per_column - 1 - (target_y // 8)
+                        glyph[x * bytes_per_column + target_chunk] |= 1 << (target_y % 8)
+
+            obj.glyphs.append(glyph)
+
+        obj.count = count
+        obj.display_labels = (
+            bbm_display_labels(first, count)
+            if custom_order else bbm_cp437_display_labels(first, count)
+        )
+
+        # BBM files begin after ASCII space. Add the missing leading slots to
+        # the editable model so every exporter handles space as a real glyph.
+        if first > 0x20:
+            space = bytearray(3 * obj.bytes_per_col)
+            blank = bytearray(obj.bytes_per_col)
+            obj.glyphs = [space] + [
+                bytearray(blank) for _ in range(first - 0x21)
+            ] + obj.glyphs
+            obj.first = 0x20
+            obj.count = len(obj.glyphs)
+        obj.has_end_offset = True
+        obj.end_offset = None
+        obj.offsets = []
+        obj.table_gap = b""
+        prefix = bytearray(28)
+        descriptor = path.stem.upper().encode("ascii", "replace")[:20]
+        prefix[:len(descriptor)] = descriptor
+        obj.prefix = bytes(prefix)
         return obj
 
     @classmethod
@@ -514,13 +629,65 @@ class LuminatorFont:
 
         return True
 
+    def _deployment_glyphs(self):
+        """Return glyphs reordered by their labels for Luminator IPS typing."""
+        labels = getattr(self, "display_labels", {})
+        if not labels:
+            return self.glyphs, self.first, self.last
+
+        mapped = {}
+        omitted = []
+        for index, source_code in enumerate(range(self.first, self.last + 1)):
+            label = " " if source_code == 0x20 else labels.get(
+                source_code, display_character_for_code(source_code)
+            )
+            if len(label) != 1:
+                raise ValueError(
+                    f"Cannot export character 0x{source_code:02X}: "
+                    f"{label!r} is not one character."
+                )
+            if not (0x20 <= ord(label) <= 0x7E):
+                omitted.append(label)
+                continue
+            target_code = ord(label)
+            if target_code in mapped:
+                previous = mapped[target_code][0]
+                raise ValueError(
+                    f"Cannot export duplicate CP437 character {label!r}: "
+                    f"source codes 0x{previous:02X} and 0x{source_code:02X}."
+                )
+            mapped[target_code] = (source_code, self.glyphs[index])
+
+        # Luminator IPS expects the ordinary printable range to be present
+        # at its ASCII byte positions, even when the source BBM omits a slot.
+        first = 0x20
+        last = 0x7E
+        blank_width = max(1, self.width(0))
+        blank = bytearray(blank_width * self.bytes_per_col)
+        space = bytearray(3 * self.bytes_per_col)
+        glyphs = [
+            bytearray(mapped[code][1]) if code in mapped
+            else bytearray(space) if code == 0x20
+            else bytearray(blank)
+            for code in range(first, last + 1)
+        ]
+        self.omitted_export_labels = sorted(set(omitted), key=ord)
+        return glyphs, first, last
+
+    def deployment_warnings(self):
+        """Return non-ASCII BBM labels that will be blank in an FNT export."""
+        self._deployment_glyphs()
+        return list(getattr(self, "omitted_export_labels", []))
+
     def save(self, path):
         b = self.OFFSET_BASE
-        table_size = self.count * 2 + (2 if self.has_end_offset else 0)
+        glyphs, first, last = self._deployment_glyphs()
+        count = last - first + 1
+        table_size = count * 2 + (2 if self.has_end_offset else 0)
         current = table_size + len(self.table_gap)
         offsets = []
 
-        for blob in self.glyphs:
+        for blob in glyphs:
             offsets.append(current)
             current += len(blob)
             if current > 0xFFFF:
@@ -532,8 +699,8 @@ class LuminatorFont:
         if len(out) > 23:
             out[22] = self.height & 0xFF
             out[23] = self.spacing & 0xFF
-            out[24] = self.first & 0xFF
-            out[25] = self.last & 0xFF
+            out[24] = first & 0xFF
+            out[25] = last & 0xFF
 
         # IMPORTANT: Luminator offsets are big-endian.
         for off in offsets:
@@ -543,7 +710,7 @@ class LuminatorFont:
             out += int(final_end).to_bytes(2, "big")
 
         out += self.table_gap
-        for blob in self.glyphs:
+        for blob in glyphs:
             out += blob
 
         Path(path).write_bytes(out)
@@ -1032,6 +1199,126 @@ class CharacterMapDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class HoverMenuToolButton(QToolButton):
+    """Show a toolbar format menu when the pointer rests on the button."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._menu_close_timer = QTimer(self)
+        self._menu_close_timer.setSingleShot(True)
+        self._menu_close_timer.timeout.connect(self._close_menu)
+
+    def setMenu(self, menu):
+        super().setMenu(menu)
+        menu.installEventFilter(self)
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._menu_close_timer.stop()
+        QTimer.singleShot(120, self._show_hover_menu)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._schedule_menu_close()
+
+    def eventFilter(self, watched, event):
+        if watched is self.menu():
+            if event.type() == QEvent.Type.Enter:
+                self._menu_close_timer.stop()
+            elif event.type() == QEvent.Type.Leave:
+                self._schedule_menu_close()
+        return super().eventFilter(watched, event)
+
+    def _show_hover_menu(self):
+        if self.isEnabled() and self.underMouse() and self.menu() and not self.menu().isVisible():
+            self.showMenu()
+
+    def _schedule_menu_close(self):
+        if self.menu() and self.menu().isVisible():
+            self._menu_close_timer.start(180)
+
+    def _close_menu(self):
+        if not self.menu() or not self.menu().isVisible():
+            return
+
+        cursor_pos = QCursor.pos()
+        over_button = self.rect().contains(self.mapFromGlobal(cursor_pos))
+        over_menu = self.menu().geometry().contains(cursor_pos)
+        if not over_button and not over_menu:
+            self.menu().hide()
+
+
+def display_character_for_code(code):
+    """Return a visible label for a one-byte font character code."""
+    code = int(code) & 0xFF
+    character = bytes([code]).decode("cp437")
+    if code == 0x20:
+        return "SPACE"
+    if code < 0x20 or code == 0x7F:
+        return f"0x{code:02X}"
+    return character
+
+
+def bbm_display_labels(first, count):
+    """Return confirmed Axion BBM labels without changing numeric glyph codes."""
+    labels = {
+        code: display_character_for_code(code)
+        for code in range(first, first + count)
+    }
+    for index, character in enumerate("abcdefghijklmnopqrstuvwxyz"):
+        code = 0x5F + index
+        if first <= code < first + count:
+            labels[code] = character
+
+    # The TRU files use a custom byte-to-character table after lowercase z.
+    # Keep each correction explicit: neither CP437 nor Unicode ordering matches.
+    extended = {
+        0x2A: "Î",
+        0x3C: "Û",
+        0x3E: "Ù",
+        0x5B: "Ü",
+        0x5D: "Ô",
+        0x5E: "_",
+        0x79: "Ç",
+        0x7A: "ü",
+        0x7B: "é",
+        0x7C: "â",
+        0x7D: "Â",
+        0x7E: "à",
+        0x7F: "ç",
+        0x80: "ê",
+        0x81: "ë",
+        0x82: "è",
+        0x83: "ï",
+        0x84: "î",
+        0x85: "ì",
+        0x86: "À",
+        0x87: "É",
+        0x88: "È",
+        0x89: "Ê",
+        0x8A: "ô",
+        0x8B: "Ë",
+        0x8C: "Ï",
+        0x8D: "û",
+        0x8E: "ù",
+    }
+    for code, character in extended.items():
+        if first <= code < first + count:
+            labels[code] = character
+    return labels
+
+
+def bbm_cp437_display_labels(first, count):
+    """Return the corrected post-tilde labels for standard BBM files."""
+    labels = {}
+    post_tilde = "éâàçêëèïîìôûù¢½¼"
+    for index, character in enumerate(post_tilde):
+        code = 0x7F + index
+        if first <= code < first + count:
+            labels[code] = character
+    return labels
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1077,18 +1364,45 @@ class MainWindow(QMainWindow):
 
         open_action = QAction("Open", self)
         open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(self.open_file)
-        toolbar.addAction(open_action)
+        open_action.triggered.connect(lambda: self.open_file("fnt"))
+        self.addAction(open_action)
+        open_menu = QMenu(self)
+        open_menu.addAction("Open FNT...", lambda: self.open_file("fnt"))
+        open_menu.addAction("Open BBM...", lambda: self.open_file("bbm"))
+        open_menu.addAction(
+            "Open SignMatrix...", lambda: self.open_file("signmatrix")
+        )
+        open_button = HoverMenuToolButton()
+        open_button.setDefaultAction(open_action)
+        open_button.setMenu(open_menu)
+        open_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        open_button.setToolTip("Open a font format")
+        toolbar.addWidget(open_button)
 
         save_action = QAction("Save", self)
         save_action.setShortcut("Ctrl+S")
         save_action.triggered.connect(self.save)
+        save_action.setEnabled(False)
+        self.save_action = save_action
         toolbar.addAction(save_action)
 
         save_as_action = QAction("Save As", self)
         save_as_action.setShortcut("Ctrl+Shift+S")
-        save_as_action.triggered.connect(self.save_as)
-        toolbar.addAction(save_as_action)
+        save_as_action.triggered.connect(lambda: self.save_as("fnt"))
+        save_as_action.setEnabled(False)
+        self.save_as_action = save_as_action
+        self.addAction(save_as_action)
+        save_as_menu = QMenu(self)
+        save_as_menu.addAction("Save as FNT...", lambda: self.save_as("fnt"))
+        save_as_menu.addAction(
+            "Save as SignMatrix...", lambda: self.save_as("signmatrix")
+        )
+        save_as_button = HoverMenuToolButton()
+        save_as_button.setDefaultAction(save_as_action)
+        save_as_button.setMenu(save_as_menu)
+        save_as_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        save_as_button.setToolTip("Save the font in a chosen format")
+        toolbar.addWidget(save_as_button)
 
         toolbar.addSeparator()
 
@@ -1096,20 +1410,6 @@ class MainWindow(QMainWindow):
         extract_action.setToolTip("Extract all embedded .fnt files from a Luminator .ips database")
         extract_action.triggered.connect(self.extract_fnts_from_ips)
         toolbar.addAction(extract_action)
-
-        import_signmatrix_action = QAction("Import from SignMatrix", self)
-        import_signmatrix_action.setToolTip(
-            "Open a SignMatrix JSON + PNG font so it can be edited and saved as FNT"
-        )
-        import_signmatrix_action.triggered.connect(self.import_from_signmatrix)
-        toolbar.addAction(import_signmatrix_action)
-
-        export_signmatrix_action = QAction("Export for SignMatrix", self)
-        export_signmatrix_action.setToolTip(
-            "Export the currently open font as a SignMatrix PNG sprite sheet and JSON metadata"
-        )
-        export_signmatrix_action.triggered.connect(self.export_for_signmatrix)
-        toolbar.addAction(export_signmatrix_action)
 
         toolbar.addSeparator()
 
@@ -1428,6 +1728,24 @@ class MainWindow(QMainWindow):
                 background: #111827;
                 color: #64748B;
                 border-color: #253047;
+            }
+
+            QMenu {
+                background: #111827;
+                color: #F8FAFC;
+                border: 1px solid #334155;
+                padding: 4px;
+            }
+            QMenu::item {
+                min-height: 16px;
+                padding: 7px 36px 7px 12px;
+                border-radius: 5px;
+            }
+            QMenu::item:selected {
+                background: #22304A;
+            }
+            QMenu::item:pressed {
+                background: #2B3B58;
             }
 
             #FilenameLabel {
@@ -1873,7 +2191,7 @@ class MainWindow(QMainWindow):
             " !@#$%^&*()-_=+[{]}\\|;:'\\\",<.>/?`~"
         )
 
-    def export_for_signmatrix(self):
+    def export_for_signmatrix(self, json_path=None):
         if not self.model:
             QMessageBox.information(
                 self,
@@ -1882,27 +2200,24 @@ class MainWindow(QMainWindow):
             )
             return
 
-        default_basename = self._signmatrix_default_basename()
+        if json_path is None:
+            default_basename = self._signmatrix_default_basename()
+            default_path = str(
+                Path(self._dialog_dir("signmatrix_export"))
+                / f"{default_basename}.json"
+            )
+            chosen_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save font as",
+                default_path,
+                "SignMatrix JSON (*.json);;All files (*.*)"
+            )
+            if not chosen_path:
+                return
+            json_path = chosen_path
 
-        # Let the user choose both the destination and export name in one
-        # normal Save dialog. The companion PNG is written beside the JSON
-        # using the same base filename.
-        default_path = str(
-            Path(self._dialog_dir("signmatrix_export"))
-            / f"{default_basename}.json"
-        )
-
-        chosen_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export for SignMatrix",
-            default_path,
-            "SignMatrix JSON (*.json);;All files (*.*)"
-        )
-        if not chosen_path:
-            return
-
-        self._remember_dialog_dir("signmatrix_export", chosen_path)
-        json_path = Path(chosen_path)
+        self._remember_dialog_dir("signmatrix_export", json_path)
+        json_path = Path(json_path)
         if json_path.suffix.lower() != ".json":
             json_path = json_path.with_suffix(".json")
 
@@ -1980,8 +2295,9 @@ class MainWindow(QMainWindow):
         height = int(self.model.height)
         advance = int(self.model.spacing)
 
+        labels = getattr(self.model, "display_labels", {})
         available = {
-            chr(code): code - self.model.first
+            " " if code == 0x20 else labels.get(code, chr(code)): code - self.model.first
             for code in range(self.model.first, self.model.last + 1)
         }
 
@@ -1998,7 +2314,7 @@ class MainWindow(QMainWindow):
         # Preserve any extra printable characters from an unusual FNT after the
         # canonical set, rather than silently dropping them.
         for code in range(self.model.first, self.model.last + 1):
-            ch = chr(code)
+            ch = " " if code == 0x20 else labels.get(code, chr(code))
             if ch not in seen and ch.isprintable():
                 chars.append(ch)
                 seen.add(ch)
@@ -2442,11 +2758,16 @@ finally {
 
         for i, code in enumerate(range(self.model.first, self.model.last + 1)):
             row, col = divmod(i, columns)
-            ch = chr(code)
+            ch = getattr(self.model, "display_labels", {}).get(
+                code, display_character_for_code(code)
+            )
             display = ch
             if code == 0x20:
                 display = ""
-            elif ch.isspace():
+            elif (
+                code < 0x20
+                and code not in getattr(self.model, "display_labels", {})
+            ) or ch.isspace():
                 display = "·"
 
             item = QTableWidgetItem(display)
@@ -2718,6 +3039,8 @@ finally {
         """Populate all editor controls from self.model."""
         self.dirty = False
         self.filename_label.setText(display_name)
+        self.save_action.setEnabled(True)
+        self.save_as_action.setEnabled(True)
 
         self._rebuild_character_table()
 
@@ -2862,15 +3185,16 @@ finally {
             6000
         )
 
-    def import_from_signmatrix(self):
-        json_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Import SignMatrix font",
-            self._dialog_dir("signmatrix_import"),
-            "SignMatrix JSON (*.json);;All files (*.*)"
-        )
-        if not json_path:
-            return
+    def import_from_signmatrix(self, json_path=None):
+        if json_path is None:
+            json_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Open font",
+                self._dialog_dir("signmatrix_import"),
+                "SignMatrix JSON (*.json);;All files (*.*)"
+            )
+            if not json_path:
+                return
 
         self._remember_dialog_dir("signmatrix_import", json_path)
 
@@ -2900,28 +3224,58 @@ finally {
             5000
         )
 
-    def open_file(self):
+    def open_file(self, format_hint=None):
+        filters = {
+            "fnt": "Luminator FNT (*.fnt);;All files (*.*)",
+            "bbm": "Axion BBM (*.BBM *.bbm);;All files (*.*)",
+            "signmatrix": "SignMatrix JSON (*.json);;All files (*.*)",
+        }
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open Luminator font",
+            "Open font",
             self._dialog_dir("font_open"),
-            "Luminator font (*.fnt);;All files (*.*)"
+            filters.get(format_hint, "Supported fonts (*.fnt *.BBM *.bbm *.json);;All files (*.*)")
         )
         if not path:
             return
         self._remember_dialog_dir("font_open", path)
 
+        source_path = Path(path)
+        if source_path.suffix.lower() == ".json":
+            self.import_from_signmatrix(path)
+            return
+
         try:
-            self.model = LuminatorFont(path)
+            is_bbm = source_path.suffix.lower() == ".bbm"
+            custom_order = False
+            if is_bbm and source_path.stem.upper().endswith("-A"):
+                reply = QMessageBox.question(
+                    self,
+                    "Custom BBM Character Order",
+                    "This filename ends in -A. Import using the custom Axion "
+                    "character order?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                custom_order = reply == QMessageBox.StandardButton.Yes
+            self.model = (
+                LuminatorFont.from_bbm(path, custom_order=custom_order)
+                if is_bbm else LuminatorFont(path)
+            )
         except Exception as e:
             QMessageBox.critical(self, "Cannot open font", str(e))
             return
 
-        self.current_path = Path(path)
-        self._imported_from_signmatrix = False
+        self.current_path = source_path.with_suffix(".fnt") if is_bbm else source_path
+        self._imported_from_signmatrix = is_bbm
         self._new_from_scratch = False
-        self._load_model_into_editor(self.current_path.name)
-        self.statusBar().showMessage(f"Opened {self.current_path.name}")
+        label = f"{source_path.name} (BBM import)" if is_bbm else self.current_path.name
+        self._load_model_into_editor(label)
+        message = (
+            f"Imported {source_path.name}; use Save As to create an FNT"
+            if is_bbm else f"Opened {self.current_path.name}"
+        )
+        self.statusBar().showMessage(message, 5000 if is_bbm else 0)
 
     def save(self):
         if not self.model:
@@ -2958,8 +3312,12 @@ finally {
         self.setWindowTitle(title)
         self.statusBar().showMessage(f"Saved {self.current_path.name}", 5000)
 
-    def save_as(self):
+    def save_as(self, format_hint="fnt"):
         if not self.model:
+            return
+
+        if format_hint == "signmatrix":
+            self.export_for_signmatrix()
             return
 
         if (self._imported_from_signmatrix or self._new_from_scratch) and self.current_path:
@@ -2974,10 +3332,27 @@ finally {
             self,
             "Save font as",
             default_path,
-            "Luminator font (*.fnt)"
+            "Luminator FNT (*.fnt)"
         )
         if not path:
             return
+
+        omitted = self.model.deployment_warnings()
+        if omitted:
+            characters = " ".join(omitted)
+            reply = QMessageBox.warning(
+                self,
+                "Accented Characters Omitted",
+                "FNT export supports the ASCII character range only. "
+                f"These characters will be omitted and their glyph slots left blank:\n\n"
+                f"{characters}\n\nContinue saving?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        path = str(Path(path).with_suffix(".fnt"))
         self._remember_dialog_dir("font_save", path)
 
         try:
@@ -3006,7 +3381,9 @@ finally {
         idx = code - self.model.first
         self.canvas.set_glyph_index(idx)
 
-        ch = chr(code)
+        ch = getattr(self.model, "display_labels", {}).get(
+            code, display_character_for_code(code)
+        )
         shown = "SPACE" if code == 0x20 else repr(ch)
         self.selected_char_label.setText(f"0x{code:02X}  {shown}")
         self.refresh_metrics()
@@ -3179,7 +3556,9 @@ finally {
 
             code = self.model.first + idx
             self._rebuild_character_table(select_code=code)
-            ch = chr(code)
+            ch = getattr(self.model, "display_labels", {}).get(
+                code, display_character_for_code(code)
+            )
             shown = "SPACE" if code == 0x20 else repr(ch)
             self.selected_char_label.setText(f"0x{code:02X}  {shown}")
 
@@ -3667,7 +4046,10 @@ finally {
         self.height_value.blockSignals(False)
         self.width_value.setText(f"{width} px")
         self.bytes_value.setText(str(self.model.bytes_per_col))
-        self.glyph_title.setText(f"Pixel Editor · {repr(chr(code))}")
+        ch = getattr(self.model, "display_labels", {}).get(
+            code, display_character_for_code(code)
+        )
+        self.glyph_title.setText(f"Pixel Editor · {repr(ch)}")
 
     def closeEvent(self, event):
         if self.dirty:
