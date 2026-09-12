@@ -49,7 +49,16 @@ The editor supports header mode values `0` and `2`, font heights up to 32 pixels
 ### Axion BBM
 Axion DataTransit `.bbm` files are fixed-slot binary bitmap fonts. They are currently import-only and not possible to write.
 
-The importer supports a limited number of observed BBM layouts only. It identifies a layout from its file size, reads each glyph's stored width and padded bitmap slot, and handles both one-byte and two-byte vertical-column encodings. For most files, the glyph height is determined from a filename containing a dimension such as `5x7`.
+Known characteristics include:
+
+- 111 fixed-size glyph slots with no file header, covering character codes `0x20` through `0x8E`
+- Slot `0x20` is the stored blank-but-width-bearing space glyph
+- Each slot begins with an encoded width followed by packed, column-major bitmap data
+- One- through four-byte vertical-column encodings, inferred from the encoded widths
+- Glyph height inferred from the filename (`5x7`, `OUTLINE-14`, or `IMP-LUM-18`); files without a recognized height use their packed-column capacity
+- Outline fonts are two pixels taller than their numeric base height, capped by their stored column capacity
+
+BBM does not contain a confirmed file-level character spacing value. The importer currently uses a legacy default of one pixel below 10 pixels high and two pixels at 10 pixels or higher.
 
 ## Conversion Notes
 
