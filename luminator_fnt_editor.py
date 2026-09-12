@@ -206,49 +206,30 @@ class LuminatorFont:
         path = Path(path)
         raw = path.read_bytes()
 
-        # Axion BBM uses fixed-size glyph slots. The slot width includes one
-        # width byte followed by padded column data; the 10/11-pixel fonts
-        # store two bytes per column.
-        layouts = {
-            666: (18, 6, 108, 5, 1),
-            888: (24, 8, 108, 7, 1),
-            1221: (22, 11, 109, 10, 2),
-            1665: (15, 15, 110, 14, 2),
-            1887: (17, 17, 110, 16, 2),
-            2109: (19, 19, 110, 18, 2),
-            2775: (25, 25, 110, 24, 2),
-        }
-        layout = layouts.get(len(raw))
-        if layout is None and len(raw) % 111 == 0:
-            # Larger Axion fonts use a header the same size as each of their
-            # 110 glyph slots. Their encoded widths reveal the column packing.
-            slot_size = len(raw) // 111
-            encoded_widths = [
-                raw[slot_size + index * slot_size]
-                for index in range(110)
-            ]
-            bytes_per_column = 0
-            for width in encoded_widths:
-                if width:
-                    bytes_per_column = (
-                        width if bytes_per_column == 0
-                        else math.gcd(bytes_per_column, width)
-                    )
-            if bytes_per_column in (1, 2, 3, 4) and all(
-                width <= slot_size - 1 for width in encoded_widths
-            ):
-                layout = (slot_size, slot_size, 110, slot_size - 1, bytes_per_column)
-
-        if layout is None:
+        # BBM contains 111 fixed-size glyph slots, starting with ASCII space.
+        # Each slot begins with its encoded width followed by packed columns;
+        # there is no file header. The width GCD gives the bytes per column.
+        if len(raw) % 111:
             raise ValueError(
                 f"Unsupported BBM size ({len(raw)} bytes). "
                 "This importer supports fixed-slot Axion BBM layouts only."
             )
 
-        header_size, slot_size, count, max_width, bytes_per_column = layout
-
-        if header_size + slot_size * count != len(raw):
-            raise ValueError("BBM payload does not match its expected glyph-slot layout.")
+        slot_size = len(raw) // 111
+        count = 111
+        encoded_widths = [raw[index * slot_size] for index in range(count)]
+        bytes_per_column = 0
+        for width in encoded_widths:
+            if width:
+                bytes_per_column = (
+                    width if bytes_per_column == 0
+                    else math.gcd(bytes_per_column, width)
+                )
+        if bytes_per_column not in (1, 2, 3, 4) or any(
+            width > slot_size - 1 for width in encoded_widths
+        ):
+            raise ValueError("BBM glyph slots do not contain valid encoded widths.")
+        max_width = slot_size - 1
 
         match = re.search(r"x(\d+)", path.stem, re.IGNORECASE)
         if match:
@@ -269,10 +250,7 @@ class LuminatorFont:
         if not 1 <= height <= bytes_per_column * 8:
             raise ValueError("BBM height and byte layout do not agree.")
 
-        # The 110-slot large layouts begin with "!". The original 109-slot
-        # 10/11-pixel family begins with a quote, while the short 108-slot
-        # layouts begin with "#".
-        first = 0x21 if count == 110 else 0x22 if height >= 10 else 0x23
+        first = 0x20
         last = first + count - 1
         spacing = 2 if height >= 10 else 1
         obj = cls.create_blank(path.stem, height, spacing, first, last, 1)
@@ -284,7 +262,7 @@ class LuminatorFont:
         bit_offset = bytes_per_column * 8 - height
 
         for index in range(count):
-            start = header_size + index * slot_size
+            start = index * slot_size
             slot = raw[start:start + slot_size]
             encoded_width = slot[0]
             if encoded_width > max_width:
@@ -322,16 +300,6 @@ class LuminatorFont:
             if custom_order else bbm_cp437_display_labels(first, count)
         )
 
-        # BBM files begin after ASCII space. Add the missing leading slots to
-        # the editable model so every exporter handles space as a real glyph.
-        if first > 0x20:
-            space = bytearray(3 * obj.bytes_per_col)
-            blank = bytearray(obj.bytes_per_col)
-            obj.glyphs = [space] + [
-                bytearray(blank) for _ in range(first - 0x21)
-            ] + obj.glyphs
-            obj.first = 0x20
-            obj.count = len(obj.glyphs)
         obj.has_end_offset = True
         obj.end_offset = None
         obj.offsets = []
