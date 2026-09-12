@@ -10,3 +10,4 @@ dist/
 .idea/
 *.log
 *.spec
+build_pyinstaller.bat
