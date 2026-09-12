@@ -1,3 +1,4 @@
+import math
 import sys
 import os
 import json
@@ -6,7 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from PyQt6.QtCore import Qt, QSize, QPoint, QTimer, QSettings, QEvent, QByteArray, pyqtSignal
-from PyQt6.QtGui import QAction, QCursor, QFont, QPainter, QColor, QPen, QImage, QIcon, QPixmap
+from PyQt6.QtGui import QAction, QFont, QPainter, QColor, QPen, QImage, QIcon, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QGridLayout, QTableWidget, QTableWidgetItem, QSlider,
     QAbstractItemView, QHeaderView, QInputDialog, QDialog, QDialogButtonBox,
     QLineEdit, QFormLayout, QStyledItemDelegate, QStyle, QMenu, QToolButton
+    , QComboBox
 )
 
 _UNDO_SVG = """
@@ -216,13 +218,34 @@ class LuminatorFont:
             2109: (19, 19, 110, 18, 2),
             2775: (25, 25, 110, 24, 2),
         }
-        try:
-            header_size, slot_size, count, max_width, bytes_per_column = layouts[len(raw)]
-        except KeyError as e:
+        layout = layouts.get(len(raw))
+        if layout is None and len(raw) % 111 == 0:
+            # Larger Axion fonts use a header the same size as each of their
+            # 110 glyph slots. Their encoded widths reveal the column packing.
+            slot_size = len(raw) // 111
+            encoded_widths = [
+                raw[slot_size + index * slot_size]
+                for index in range(110)
+            ]
+            bytes_per_column = 0
+            for width in encoded_widths:
+                if width:
+                    bytes_per_column = (
+                        width if bytes_per_column == 0
+                        else math.gcd(bytes_per_column, width)
+                    )
+            if bytes_per_column in (1, 2, 3, 4) and all(
+                width <= slot_size - 1 for width in encoded_widths
+            ):
+                layout = (slot_size, slot_size, 110, slot_size - 1, bytes_per_column)
+
+        if layout is None:
             raise ValueError(
                 f"Unsupported BBM size ({len(raw)} bytes). "
-                "This importer supports the observed Axion BBM layouts only."
-            ) from e
+                "This importer supports fixed-slot Axion BBM layouts only."
+            )
+
+        header_size, slot_size, count, max_width, bytes_per_column = layout
 
         if header_size + slot_size * count != len(raw):
             raise ValueError("BBM payload does not match its expected glyph-slot layout.")
@@ -232,11 +255,17 @@ class LuminatorFont:
             height = int(match.group(1))
         elif path.stem.upper() == "F-DIGITAL":
             height = 8
+        elif match := re.search(r"-(\d+)(?:\s|$)", path.stem):
+            height = int(match.group(1))
+        elif len(raw) % 111 == 0:
+            height = bytes_per_column * 8
         else:
             raise ValueError(
                 "Could not determine the BBM glyph height from its filename "
                 "(expected a name such as F-DF5x7N.BBM)."
             )
+        if path.stem.upper().startswith("OUTLINE"):
+            height = min(height + 2, bytes_per_column * 8)
         if not 1 <= height <= bytes_per_column * 8:
             raise ValueError("BBM height and byte layout do not agree.")
 
@@ -360,6 +389,7 @@ class LuminatorFont:
             raise ValueError("SignMatrix JSON does not contain any glyph entries.")
 
         parsed = {}
+        parsed_order = []
         for n, entry in enumerate(glyph_entries, start=1):
             if not isinstance(entry, dict):
                 raise ValueError(f"Glyph entry {n} is not an object.")
@@ -368,13 +398,6 @@ class LuminatorFont:
             if not isinstance(ch, str) or len(ch) != 1:
                 raise ValueError(
                     f"Glyph entry {n} must contain exactly one character in 'char'."
-                )
-
-            code = ord(ch)
-            if not 0 <= code <= 255:
-                raise ValueError(
-                    f"Character {ch!r} (U+{code:04X}) cannot be represented "
-                    "by the one-byte Luminator FNT character range."
                 )
 
             try:
@@ -396,14 +419,26 @@ class LuminatorFont:
                     f"Glyph {ch!r} lies outside the companion PNG bounds."
                 )
 
-            if code in parsed:
+            if ch in parsed:
                 raise ValueError(f"Duplicate glyph entry for character {ch!r}.")
 
-            parsed[code] = (x, y, width)
+            parsed[ch] = (x, y, width)
+            parsed_order.append(ch)
 
-        first = min(parsed)
-        last = max(parsed)
-        count = last - first + 1
+        if len(parsed_order) > 256:
+            raise ValueError(
+                "This editor can open at most 256 SignMatrix glyphs at once."
+            )
+
+        # Keep the space glyph at the Luminator-compatible 0x20 slot. Other
+        # SignMatrix Unicode labels use adjacent internal slots and are kept
+        # in display_labels rather than treated as byte codes.
+        characters = ([" "] if " " in parsed else []) + [
+            ch for ch in parsed_order if ch != " "
+        ]
+        first = 0x20
+        last = first + len(characters) - 1
+        count = len(characters)
         bytes_per_col = (height + 7) // 8
 
         obj = cls.__new__(cls)
@@ -437,33 +472,26 @@ class LuminatorFont:
         obj.table_gap = b""
         obj.offsets = []
         obj.glyphs = []
+        obj.display_labels = {}
 
-        for code in range(first, last + 1):
-            if code in parsed:
-                gx, gy, width = parsed[code]
-            else:
-                # SignMatrix can omit characters inside an otherwise
-                # contiguous byte range. FNT cannot omit an offset-table slot,
-                # so represent such a character as a one-column blank glyph.
-                width = 1
-                gx = gy = None
+        for code, ch in enumerate(characters, start=first):
+            gx, gy, width = parsed[ch]
+            obj.display_labels[code] = ch
 
             blob = bytearray(width * bytes_per_col)
 
-            if gx is not None:
-                for x in range(width):
-                    for y in range(height):
-                        pixel = image.pixelColor(gx + x, gy + y)
+            for x in range(width):
+                for y in range(height):
+                    pixel = image.pixelColor(gx + x, gy + y)
 
-                        # Supplied SignMatrix sheets use transparent background
-                        # and opaque white lit pixels. Treat any visible pixel
-                        # as lit, which also tolerates differently colored
-                        # SignMatrix sprite sheets.
-                        if pixel.alpha() > 0:
-                            chunk = y // 8
-                            stored_chunk = bytes_per_col - 1 - chunk
-                            p = x * bytes_per_col + stored_chunk
-                            blob[p] |= 1 << (y % 8)
+                    # Supplied SignMatrix sheets use transparent background
+                    # and opaque white lit pixels. Treat any visible pixel
+                    # as lit, which also tolerates differently colored sheets.
+                    if pixel.alpha() > 0:
+                        chunk = y // 8
+                        stored_chunk = bytes_per_col - 1 - chunk
+                        p = x * bytes_per_col + stored_chunk
+                        blob[p] |= 1 << (y % 8)
 
             obj.glyphs.append(blob)
 
@@ -714,6 +742,163 @@ class LuminatorFont:
             out += blob
 
         Path(path).write_bytes(out)
+
+
+class HanoverFont:
+    """Hanover HELEN text FNT: 224 vertical 32-bit-column glyphs with widths."""
+
+    FIRST_CODE = 0x20
+    LAST_CODE = 0xFF
+    GLYPH_COUNT = LAST_CODE - FIRST_CODE + 1
+
+    def __init__(self, path):
+        self.path = Path(path)
+        try:
+            with self.path.open("r", encoding="ascii", newline="") as source:
+                text = source.read()
+            self.newline = "\r\n" if "\r\n" in text else "\n"
+            lines = text.splitlines()
+            header = [int(value) for value in lines[0].split()]
+            widths = [int(value) for value in lines[1].split()]
+        except (IndexError, UnicodeDecodeError, ValueError) as e:
+            raise ValueError("File is not a valid Hanover FNT text font.") from e
+
+        if len(header) != 5 or header[0] not in (0, 2):
+            raise ValueError("Unsupported Hanover FNT header.")
+        if len(widths) != self.GLYPH_COUNT:
+            raise ValueError(
+                f"Hanover FNT must contain {self.GLYPH_COUNT} character widths."
+            )
+
+        self.version, self.height, self.max_width, self.character_set, self.spacing = header
+        if not 1 <= self.height <= 32:
+            raise ValueError("Hanover FNT height must be between 1 and 32 pixels.")
+        if not 1 <= self.max_width <= 32:
+            raise ValueError("Hanover FNT maximum glyph width must be between 1 and 32 pixels.")
+        if not all(0 <= width <= self.max_width for width in widths):
+            raise ValueError("Hanover FNT character widths exceed the maximum glyph width.")
+
+        rows = lines[2:]
+        if len(rows) != self.GLYPH_COUNT:
+            raise ValueError(
+                f"Hanover FNT must contain {self.GLYPH_COUNT} glyph rows."
+            )
+        try:
+            words = [[int(value) for value in row.split()] for row in rows]
+        except ValueError as e:
+            raise ValueError("Hanover FNT bitmap data must be signed decimal integers.") from e
+        if any(len(row) != self.max_width for row in words):
+            raise ValueError("Each Hanover FNT glyph row must contain one value per bitmap column.")
+        if any(value < -0x80000000 or value > 0x7FFFFFFF for row in words for value in row):
+            raise ValueError("Hanover FNT bitmap values must fit in signed 32 bits.")
+
+        # A glyph record contains exactly the header's maximum number of
+        # bitmap columns. Some final columns happen to equal the width table,
+        # but they remain genuine pixel data (not a width footer).
+        self.has_width_footer = False
+        self.bitmap_columns = self.max_width
+        self.advance_widths = list(widths)
+
+        self.first = self.FIRST_CODE
+        self.last = self.LAST_CODE
+        self.count = self.GLYPH_COUNT
+        self.bytes_per_col = (self.height + 7) // 8
+        self.glyphs = []
+        for width, glyph_rows in zip(widths, words):
+            glyph = bytearray(width * self.bytes_per_col)
+            for x, signed_word in enumerate(glyph_rows[:width]):
+                word = signed_word & 0xFFFFFFFF
+                for y in range(self.height):
+                    if word & (1 << y):
+                        self._set_pixel_in_blob(glyph, x, y, True)
+            self.glyphs.append(glyph)
+        self.display_labels = hanover_display_labels()
+
+    def _set_pixel_in_blob(self, blob, x, y, on):
+        stored_chunk = self.bytes_per_col - 1 - (y // 8)
+        offset = x * self.bytes_per_col + stored_chunk
+        mask = 1 << (y % 8)
+        if on:
+            blob[offset] |= mask
+        else:
+            blob[offset] &= (~mask) & 0xFF
+
+    def width(self, idx):
+        return len(self.glyphs[idx]) // self.bytes_per_col
+
+    def pixel(self, idx, x, y):
+        stored_chunk = self.bytes_per_col - 1 - (y // 8)
+        offset = x * self.bytes_per_col + stored_chunk
+        return bool(self.glyphs[idx][offset] & (1 << (y % 8)))
+
+    def set_pixel(self, idx, x, y, on):
+        self._set_pixel_in_blob(self.glyphs[idx], x, y, on)
+
+    def bottom_rows_have_pixels(self, new_height):
+        return any(
+            self.pixel(idx, x, y)
+            for idx in range(self.count)
+            for y in range(new_height, self.height)
+            for x in range(self.width(idx))
+        )
+
+    def resize_height(self, new_height):
+        if not 1 <= new_height <= 32:
+            raise ValueError("Hanover FNT height must be between 1 and 32 pixels.")
+        if new_height == self.height:
+            return
+        old_glyphs = self.glyphs
+        old_height = self.height
+        old_bytes_per_col = self.bytes_per_col
+        self.height = new_height
+        self.bytes_per_col = (new_height + 7) // 8
+        self.glyphs = []
+        for old_blob in old_glyphs:
+            width = len(old_blob) // old_bytes_per_col
+            glyph = bytearray(width * self.bytes_per_col)
+            for y in range(min(old_height, new_height)):
+                for x in range(width):
+                    stored_chunk = old_bytes_per_col - 1 - (y // 8)
+                    if old_blob[x * old_bytes_per_col + stored_chunk] & (1 << (y % 8)):
+                        self._set_pixel_in_blob(glyph, x, y, True)
+            self.glyphs.append(glyph)
+
+    def add_column(self, idx, side="right"):
+        if self.width(idx) >= self.bitmap_columns:
+            raise ValueError("Hanover FNT glyphs cannot exceed 32 pixels wide.")
+        blank = b"\x00" * self.bytes_per_col
+        if side == "left":
+            self.glyphs[idx] = bytearray(blank) + self.glyphs[idx]
+        else:
+            self.glyphs[idx].extend(blank)
+        self.max_width = max(self.max_width, self.width(idx))
+        self.advance_widths[idx] = self.width(idx)
+
+    def remove_column(self, idx, side="right"):
+        if self.width(idx) <= 0:
+            return False
+        if side == "left":
+            del self.glyphs[idx][:self.bytes_per_col]
+        else:
+            del self.glyphs[idx][-self.bytes_per_col:]
+        self.advance_widths[idx] = self.width(idx)
+        return True
+
+    def deployment_warnings(self):
+        return []
+
+    def save(self, path):
+        header = (self.version, self.height, self.max_width, self.character_set, self.spacing)
+        lines = [" ".join(map(str, header))]
+        lines.append(" ".join(map(str, self.advance_widths)))
+        for idx in range(self.count):
+            values = []
+            for x in range(self.max_width):
+                word = sum(1 << y for y in range(self.height) if x < self.width(idx) and self.pixel(idx, x, y))
+                values.append(str(word if word < 0x80000000 else word - 0x100000000))
+            lines.append(" ".join(values))
+        with Path(path).open("w", encoding="ascii", newline="") as destination:
+            destination.write(self.newline.join(lines) + self.newline)
 
 
 
@@ -1199,55 +1384,6 @@ class CharacterMapDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-class HoverMenuToolButton(QToolButton):
-    """Show a toolbar format menu when the pointer rests on the button."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._menu_close_timer = QTimer(self)
-        self._menu_close_timer.setSingleShot(True)
-        self._menu_close_timer.timeout.connect(self._close_menu)
-
-    def setMenu(self, menu):
-        super().setMenu(menu)
-        menu.installEventFilter(self)
-
-    def enterEvent(self, event):
-        super().enterEvent(event)
-        self._menu_close_timer.stop()
-        QTimer.singleShot(120, self._show_hover_menu)
-
-    def leaveEvent(self, event):
-        super().leaveEvent(event)
-        self._schedule_menu_close()
-
-    def eventFilter(self, watched, event):
-        if watched is self.menu():
-            if event.type() == QEvent.Type.Enter:
-                self._menu_close_timer.stop()
-            elif event.type() == QEvent.Type.Leave:
-                self._schedule_menu_close()
-        return super().eventFilter(watched, event)
-
-    def _show_hover_menu(self):
-        if self.isEnabled() and self.underMouse() and self.menu() and not self.menu().isVisible():
-            self.showMenu()
-
-    def _schedule_menu_close(self):
-        if self.menu() and self.menu().isVisible():
-            self._menu_close_timer.start(180)
-
-    def _close_menu(self):
-        if not self.menu() or not self.menu().isVisible():
-            return
-
-        cursor_pos = QCursor.pos()
-        over_button = self.rect().contains(self.mapFromGlobal(cursor_pos))
-        over_menu = self.menu().geometry().contains(cursor_pos)
-        if not over_button and not over_menu:
-            self.menu().hide()
-
-
 def display_character_for_code(code):
     """Return a visible label for a one-byte font character code."""
     code = int(code) & 0xFF
@@ -1257,6 +1393,19 @@ def display_character_for_code(code):
     if code < 0x20 or code == 0x7F:
         return f"0x{code:02X}"
     return character
+
+
+def hanover_display_labels():
+    """Return the HELEN single-byte character map (Windows-1252)."""
+    labels = {}
+    for code in range(HanoverFont.FIRST_CODE, HanoverFont.LAST_CODE + 1):
+        try:
+            labels[code] = bytes([code]).decode("cp1252")
+        except UnicodeDecodeError:
+            # Windows-1252 reserves these byte positions; HELEN leaves them blank.
+            labels[code] = ""
+    labels[0x7F] = ""
+    return labels
 
 
 def bbm_display_labels(first, count):
@@ -1320,6 +1469,16 @@ def bbm_cp437_display_labels(first, count):
 
 
 class MainWindow(QMainWindow):
+    SOURCE_FORMATS = (
+        ("Luminator (.FNT)", "luminator"),
+        ("Hanover (.FNT)", "hanover"),
+        ("Axion (.BBM)", "bbm"),
+        ("SignMatrix (.JSON+.PNG)", "signmatrix"),
+    )
+    TARGET_FORMATS = tuple(
+        item for item in SOURCE_FORMATS if item[1] != "bbm"
+    )
+
     def __init__(self):
         super().__init__()
         self.model = None
@@ -1364,15 +1523,19 @@ class MainWindow(QMainWindow):
 
         open_action = QAction("Open", self)
         open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(lambda: self.open_file("fnt"))
         self.addAction(open_action)
         open_menu = QMenu(self)
-        open_menu.addAction("Open FNT...", lambda: self.open_file("fnt"))
-        open_menu.addAction("Open BBM...", lambda: self.open_file("bbm"))
         open_menu.addAction(
-            "Open SignMatrix...", lambda: self.open_file("signmatrix")
+            "Luminator (.FNT)", lambda: self.open_file("luminator")
         )
-        open_button = HoverMenuToolButton()
+        open_menu.addAction(
+            "Hanover (.FNT)", lambda: self.open_file("hanover")
+        )
+        open_menu.addAction("Axion (.BBM)", lambda: self.open_file("bbm"))
+        open_menu.addAction(
+            "SignMatrix (.JSON+.PNG)", lambda: self.open_file("signmatrix")
+        )
+        open_button = QToolButton()
         open_button.setDefaultAction(open_action)
         open_button.setMenu(open_menu)
         open_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -1388,16 +1551,21 @@ class MainWindow(QMainWindow):
 
         save_as_action = QAction("Save As", self)
         save_as_action.setShortcut("Ctrl+Shift+S")
-        save_as_action.triggered.connect(lambda: self.save_as("fnt"))
+        save_as_action.triggered.connect(self.save_as)
         save_as_action.setEnabled(False)
         self.save_as_action = save_as_action
         self.addAction(save_as_action)
         save_as_menu = QMenu(self)
-        save_as_menu.addAction("Save as FNT...", lambda: self.save_as("fnt"))
         save_as_menu.addAction(
-            "Save as SignMatrix...", lambda: self.save_as("signmatrix")
+            "Luminator (.FNT)", lambda: self.save_as("luminator")
         )
-        save_as_button = HoverMenuToolButton()
+        save_as_menu.addAction(
+            "Hanover (.FNT)", lambda: self.save_as("hanover")
+        )
+        save_as_menu.addAction(
+            "SignMatrix (.JSON+.PNG)", lambda: self.save_as("signmatrix")
+        )
+        save_as_button = QToolButton()
         save_as_button.setDefaultAction(save_as_action)
         save_as_button.setMenu(save_as_menu)
         save_as_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -1405,6 +1573,11 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(save_as_button)
 
         toolbar.addSeparator()
+
+        batch_convert_action = QAction("Mass Convert", self)
+        batch_convert_action.setToolTip("Convert multiple font files into another supported format")
+        batch_convert_action.triggered.connect(self.mass_convert_fonts)
+        toolbar.addAction(batch_convert_action)
 
         extract_action = QAction("Extract FNTs from IPS", self)
         extract_action.setToolTip("Extract all embedded .fnt files from a Luminator .ips database")
@@ -1728,6 +1901,13 @@ class MainWindow(QMainWindow):
                 background: #111827;
                 color: #64748B;
                 border-color: #253047;
+            }
+            QToolButton::menu-button {
+                width: 24px;
+                border: none;
+            }
+            QToolButton::menu-arrow {
+                margin-left: 6px;
             }
 
             QMenu {
@@ -2191,6 +2371,171 @@ class MainWindow(QMainWindow):
             " !@#$%^&*()-_=+[{]}\\|;:'\\\",<.>/?`~"
         )
 
+    def _export_character_entries(self):
+        """Return visible source glyphs as (source code, label, index) tuples."""
+        labels = getattr(self.model, "display_labels", {})
+        entries = []
+        for index, code in enumerate(range(self.model.first, self.model.last + 1)):
+            label = " " if code == 0x20 else labels.get(
+                code, display_character_for_code(code)
+            )
+            has_pixels = any(
+                self.model.pixel(index, x, y)
+                for y in range(self.model.height)
+                for x in range(self.model.width(index))
+            )
+            if has_pixels or (code == 0x20 and self.model.width(index) > 0):
+                entries.append((code, label, index))
+        return entries
+
+    def _target_character_code(self, label, target_format):
+        if len(label) != 1:
+            return None
+        if target_format == "luminator":
+            return ord(label) if 0x20 <= ord(label) <= 0x7E else None
+        if target_format == "hanover":
+            try:
+                code = label.encode("cp1252")[0]
+            except UnicodeEncodeError:
+                return None
+            return code if code >= HanoverFont.FIRST_CODE else None
+        if target_format == "signmatrix":
+            # SignMatrix JSON stores Unicode text, and its glyph atlas has no
+            # one-byte character-code limit. The Luminator importer has that
+            # limit, but it must not restrict a SignMatrix export.
+            return ord(label) if label.isprintable() else None
+        raise ValueError(f"Unknown target format: {target_format}")
+
+    def _target_conversion_issues(self, target_format):
+        unsupported = []
+        oversized = []
+        collisions = {}
+        mapped = {}
+        for code, label, index in self._export_character_entries():
+            target_code = self._target_character_code(label, target_format)
+            if target_code is None:
+                unsupported.append((code, label))
+                continue
+            if target_format == "hanover" and self.model.width(index) > 32:
+                oversized.append((code, label, self.model.width(index)))
+                continue
+            if target_code in mapped:
+                collisions.setdefault(target_code, [mapped[target_code]])
+                collisions[target_code].append((code, label, index))
+            else:
+                mapped[target_code] = (code, label, index)
+        return unsupported, oversized, collisions
+
+    def _confirm_target_character_support(self, target_format):
+        unsupported, oversized, collisions = self._target_conversion_issues(target_format)
+        if not unsupported and not oversized and not collisions:
+            return True
+
+        target_name = {
+            "luminator": "Luminator FNT",
+            "hanover": "Hanover FNT",
+            "signmatrix": "SignMatrix",
+        }[target_format]
+        details = []
+        if unsupported:
+            details.append(
+                "Unsupported characters (their glyphs will be omitted):\n"
+                + " ".join(f"{label!r} (0x{code:02X})" for code, label in unsupported)
+            )
+        if collisions:
+            details.append(
+                "Character mapping collisions (only the first glyph will be kept):\n"
+                + " ".join(
+                    f"{entries[0][1]!r}" for entries in collisions.values()
+                )
+            )
+        if oversized:
+            details.append(
+                "Glyphs wider than Hanover's 32-pixel limit cannot be converted:\n"
+                + " ".join(f"{label!r} ({width}px)" for _, label, width in oversized)
+            )
+        reply = QMessageBox.warning(
+            self,
+            "Character conversion warning",
+            f"{target_name} cannot represent all source glyphs.\n\n"
+            + "\n\n".join(details)
+            + "\n\nContinue and omit the unsupported glyphs?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _convert_model_for_fnt(self, target_format):
+        """Build a native FNT model after target character support is confirmed."""
+        entries = self._export_character_entries()
+        mapped = {}
+        for code, label, index in entries:
+            target_code = self._target_character_code(label, target_format)
+            is_oversized = (
+                target_format == "hanover" and self.model.width(index) > 32
+            )
+            if target_code is not None and not is_oversized and target_code not in mapped:
+                mapped[target_code] = index
+
+        if target_format == "luminator":
+            target = LuminatorFont.create_blank(
+                "CONVERTED", self.model.height, self.model.spacing, 0x20, 0x7E, 1
+            )
+        elif target_format == "hanover":
+            target = HanoverFont.__new__(HanoverFont)
+            target.path = None
+            target.version = 2
+            target.height = self.model.height
+            target.max_width = 1
+            target.bitmap_columns = 1
+            target.has_width_footer = False
+            target.character_set = 0
+            target.spacing = self.model.spacing
+            # HELEN's legacy text reader expects DOS records when importing
+            # newly generated fonts; native Hanover files use CRLF as well.
+            target.newline = "\r\n"
+            target.first = HanoverFont.FIRST_CODE
+            target.last = HanoverFont.LAST_CODE
+            target.count = HanoverFont.GLYPH_COUNT
+            target.bytes_per_col = (target.height + 7) // 8
+            target.glyphs = [bytearray() for _ in range(target.count)]
+            target.advance_widths = [0] * target.count
+            target.display_labels = hanover_display_labels()
+        else:
+            raise ValueError(f"Unknown FNT target format: {target_format}")
+
+        for target_code, source_index in mapped.items():
+            if not (target.first <= target_code <= target.last):
+                continue
+            width = self.model.width(source_index)
+            target_index = target_code - target.first
+            target.glyphs[target_index] = bytearray(width * target.bytes_per_col)
+            for y in range(target.height):
+                for x in range(width):
+                    if self.model.pixel(source_index, x, y):
+                        target.set_pixel(target_index, x, y, True)
+            if target_format == "hanover":
+                target.max_width = max(target.max_width, width)
+                target.bitmap_columns = target.max_width
+                target.advance_widths[target_index] = width
+        return target
+
+    def _confirm_luminator_omissions(self):
+        omitted = self.model.deployment_warnings()
+        if not omitted:
+            return True
+        characters = " ".join(omitted)
+        reply = QMessageBox.warning(
+            self,
+            "Accented Characters Omitted",
+            "Luminator FNT supports the printable ASCII character range only. "
+            f"These characters will be omitted and their glyph slots left blank:\n\n"
+            f"{characters}\n\nContinue saving?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
     def export_for_signmatrix(self, json_path=None):
         if not self.model:
             QMessageBox.information(
@@ -2198,6 +2543,9 @@ class MainWindow(QMainWindow):
                 "No font open",
                 "Open a .fnt file before exporting for SignMatrix."
             )
+            return
+
+        if not self._confirm_target_character_support("signmatrix"):
             return
 
         if json_path is None:
@@ -2295,10 +2643,10 @@ class MainWindow(QMainWindow):
         height = int(self.model.height)
         advance = int(self.model.spacing)
 
-        labels = getattr(self.model, "display_labels", {})
         available = {
-            " " if code == 0x20 else labels.get(code, chr(code)): code - self.model.first
-            for code in range(self.model.first, self.model.last + 1)
+            label: index
+            for _code, label, index in self._export_character_entries()
+            if self._target_character_code(label, "signmatrix") is not None
         }
 
         # Filter the canonical SignMatrix ordering to characters actually
@@ -2314,8 +2662,10 @@ class MainWindow(QMainWindow):
         # Preserve any extra printable characters from an unusual FNT after the
         # canonical set, rather than silently dropping them.
         for code in range(self.model.first, self.model.last + 1):
-            ch = " " if code == 0x20 else labels.get(code, chr(code))
-            if ch not in seen and ch.isprintable():
+            ch = " " if code == 0x20 else getattr(
+                self.model, "display_labels", {}
+            ).get(code, chr(code))
+            if ch in available and ch not in seen and ch.isprintable():
                 chars.append(ch)
                 seen.add(ch)
 
@@ -3226,9 +3576,10 @@ finally {
 
     def open_file(self, format_hint=None):
         filters = {
-            "fnt": "Luminator FNT (*.fnt);;All files (*.*)",
-            "bbm": "Axion BBM (*.BBM *.bbm);;All files (*.*)",
-            "signmatrix": "SignMatrix JSON (*.json);;All files (*.*)",
+            "luminator": "Luminator (.FNT) (*.fnt);;All files (*.*)",
+            "hanover": "Hanover (.FNT) (*.fnt);;All files (*.*)",
+            "bbm": "Axion (.BBM) (*.BBM *.bbm);;All files (*.*)",
+            "signmatrix": "SignMatrix (.JSON+.PNG) (*.json);;All files (*.*)",
         }
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -3260,7 +3611,8 @@ finally {
                 custom_order = reply == QMessageBox.StandardButton.Yes
             self.model = (
                 LuminatorFont.from_bbm(path, custom_order=custom_order)
-                if is_bbm else LuminatorFont(path)
+                if is_bbm else HanoverFont(path)
+                if format_hint == "hanover" else LuminatorFont(path)
             )
         except Exception as e:
             QMessageBox.critical(self, "Cannot open font", str(e))
@@ -3269,13 +3621,204 @@ finally {
         self.current_path = source_path.with_suffix(".fnt") if is_bbm else source_path
         self._imported_from_signmatrix = is_bbm
         self._new_from_scratch = False
-        label = f"{source_path.name} (BBM import)" if is_bbm else self.current_path.name
+        if is_bbm:
+            label = f"{source_path.name} (BBM import)"
+        elif format_hint == "hanover":
+            label = f"{self.current_path.name} (Hanover)"
+        else:
+            label = f"{self.current_path.name} (Luminator)"
         self._load_model_into_editor(label)
         message = (
             f"Imported {source_path.name}; use Save As to create an FNT"
             if is_bbm else f"Opened {self.current_path.name}"
         )
         self.statusBar().showMessage(message, 5000 if is_bbm else 0)
+
+    def _batch_file_filter(self, source_format):
+        return {
+            "luminator": "Luminator (.FNT) (*.fnt)",
+            "hanover": "Hanover (.FNT) (*.fnt)",
+            "bbm": "Axion (.BBM) (*.BBM *.bbm)",
+            "signmatrix": "SignMatrix (.JSON+.PNG) (*.json)",
+        }[source_format] + ";;All files (*.*)"
+
+    def _load_batch_source(self, path, source_format):
+        if source_format == "luminator":
+            return LuminatorFont(path)
+        if source_format == "hanover":
+            return HanoverFont(path)
+        if source_format == "bbm":
+            return LuminatorFont.from_bbm(
+                path, custom_order=Path(path).stem.upper().endswith("-A")
+            )
+        if source_format == "signmatrix":
+            return LuminatorFont.from_signmatrix(path)
+        raise ValueError(f"Unknown source format: {source_format}")
+
+    def _batch_output_path(self, output_dir, source_path, target_format, used_paths):
+        extension = ".json" if target_format == "signmatrix" else ".fnt"
+        candidate = output_dir / f"{source_path.stem}{extension}"
+        sequence = 2
+        while candidate in used_paths or candidate.exists():
+            candidate = output_dir / f"{source_path.stem}_{sequence}{extension}"
+            sequence += 1
+        used_paths.add(candidate)
+        return candidate
+
+    def mass_convert_fonts(self):
+        """Convert a selected group of font files without changing the open font."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Mass Convert Fonts")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        source_format = QComboBox()
+        target_format = QComboBox()
+        for label, value in self.SOURCE_FORMATS:
+            source_format.addItem(label, value)
+        for label, value in self.TARGET_FORMATS:
+            target_format.addItem(label, value)
+        form.addRow("Source format", source_format)
+        form.addRow("Target format", target_format)
+
+        selected_paths = []
+        source_files_label = QLabel("No files selected")
+        source_files_label.setWordWrap(True)
+        choose_files = QPushButton("Choose Files")
+
+        def choose_source_files():
+            paths, _ = QFileDialog.getOpenFileNames(
+                dialog,
+                "Choose source fonts",
+                self._dialog_dir("batch_source"),
+                self._batch_file_filter(source_format.currentData()),
+            )
+            if not paths:
+                return
+            selected_paths[:] = [Path(path) for path in paths]
+            self._remember_dialog_dir("batch_source", paths[0])
+            source_files_label.setText(f"{len(selected_paths)} file(s) selected")
+
+        choose_files.clicked.connect(choose_source_files)
+        source_row = QHBoxLayout()
+        source_row.addWidget(choose_files)
+        source_row.addWidget(source_files_label, 1)
+        form.addRow("Source files", source_row)
+
+        output_dir = [None]
+        output_label = QLabel("No target directory selected")
+        output_label.setWordWrap(True)
+        choose_directory = QPushButton("Choose Folder")
+
+        def choose_target_directory():
+            path = QFileDialog.getExistingDirectory(
+                dialog, "Choose target folder", self._dialog_dir("batch_target")
+            )
+            if not path:
+                return
+            output_dir[0] = Path(path)
+            self._remember_dialog_dir("batch_target", path)
+            output_label.setText(str(output_dir[0]))
+
+        choose_directory.clicked.connect(choose_target_directory)
+        output_row = QHBoxLayout()
+        output_row.addWidget(choose_directory)
+        output_row.addWidget(output_label, 1)
+        form.addRow("Target directory", output_row)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        convert_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        convert_button.setText("Convert")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not selected_paths or output_dir[0] is None:
+            QMessageBox.warning(
+                self, "Mass Convert Fonts", "Choose at least one source file and a target directory."
+            )
+            return
+
+        source_kind = source_format.currentData()
+        target_kind = target_format.currentData()
+        prepared = []
+        failures = []
+        warnings = []
+        original_model = self.model
+        try:
+            for source_path in selected_paths:
+                try:
+                    model = self._load_batch_source(str(source_path), source_kind)
+                    self.model = model
+                    issues = self._target_conversion_issues(target_kind)
+                    prepared.append((source_path, model, issues))
+                    unsupported, oversized, collisions = issues
+                    if unsupported or oversized or collisions:
+                        warnings.append(source_path.name)
+                except Exception as e:
+                    failures.append(f"{source_path.name}: {e}")
+        finally:
+            self.model = original_model
+
+        if warnings:
+            reply = QMessageBox.warning(
+                self,
+                "Character conversion warnings",
+                f"{len(warnings)} file(s) contain characters that {target_format.currentText()} "
+                "cannot represent. Unsupported glyphs will be omitted and duplicate "
+                "character mappings will keep the first glyph.\n\n"
+                + "\n".join(warnings[:12])
+                + ("\n..." if len(warnings) > 12 else "")
+                + "\n\nContinue converting?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        written = []
+        used_paths = set()
+        try:
+            for source_path, model, _issues in prepared:
+                destination = self._batch_output_path(
+                    output_dir[0], source_path, target_kind, used_paths
+                )
+                self.model = model
+                if target_kind == "signmatrix":
+                    self._write_signmatrix_export(
+                        destination,
+                        destination.with_suffix(".png"),
+                        destination.stem,
+                        self._signmatrix_description(destination.stem),
+                    )
+                else:
+                    expected_type = HanoverFont if target_kind == "hanover" else LuminatorFont
+                    output_model = (
+                        model if isinstance(model, expected_type)
+                        else self._convert_model_for_fnt(target_kind)
+                    )
+                    output_model.save(destination)
+                written.append(destination.name)
+        except Exception as e:
+            failures.append(str(e))
+        finally:
+            self.model = original_model
+
+        summary = f"Converted {len(written)} of {len(selected_paths)} file(s) to {output_dir[0]}."
+        if failures:
+            summary += "\n\nSkipped or failed:\n" + "\n".join(failures[:12])
+            if len(failures) > 12:
+                summary += "\n..."
+            QMessageBox.warning(self, "Mass conversion finished", summary)
+        else:
+            QMessageBox.information(self, "Mass conversion finished", summary)
+        self.statusBar().showMessage(summary.split("\n", 1)[0], 6000)
 
     def save(self):
         if not self.model:
@@ -3284,6 +3827,9 @@ finally {
         # No real FNT path yet (new/imported font), so fall back to Save As.
         if self.current_path is None or self._imported_from_signmatrix or self._new_from_scratch:
             self.save_as()
+            return
+
+        if isinstance(self.model, LuminatorFont) and not self._confirm_luminator_omissions():
             return
 
         path_key = str(self.current_path)
@@ -3312,12 +3858,20 @@ finally {
         self.setWindowTitle(title)
         self.statusBar().showMessage(f"Saved {self.current_path.name}", 5000)
 
-    def save_as(self, format_hint="fnt"):
+    def save_as(self, format_hint=None):
         if not self.model:
             return
 
         if format_hint == "signmatrix":
             self.export_for_signmatrix()
+            return
+
+        if format_hint is None:
+            format_hint = "hanover" if isinstance(self.model, HanoverFont) else "luminator"
+
+        expected_model = HanoverFont if format_hint == "hanover" else LuminatorFont
+        cross_format = not isinstance(self.model, expected_model)
+        if cross_format and not self._confirm_target_character_support(format_hint):
             return
 
         if (self._imported_from_signmatrix or self._new_from_scratch) and self.current_path:
@@ -3332,36 +3886,32 @@ finally {
             self,
             "Save font as",
             default_path,
-            "Luminator FNT (*.fnt)"
+            "FNT (Hanover) (*.fnt)" if format_hint == "hanover"
+            else "FNT (Luminator) (*.fnt)"
         )
         if not path:
             return
 
-        omitted = self.model.deployment_warnings()
-        if omitted:
-            characters = " ".join(omitted)
-            reply = QMessageBox.warning(
-                self,
-                "Accented Characters Omitted",
-                "FNT export supports the ASCII character range only. "
-                f"These characters will be omitted and their glyph slots left blank:\n\n"
-                f"{characters}\n\nContinue saving?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+        if not cross_format and format_hint == "luminator":
+            if not self._confirm_luminator_omissions():
                 return
 
         path = str(Path(path).with_suffix(".fnt"))
         self._remember_dialog_dir("font_save", path)
 
         try:
-            self.model.save(path)
+            model_to_save = (
+                self._convert_model_for_fnt(format_hint)
+                if cross_format else self.model
+            )
+            model_to_save.save(path)
         except Exception as e:
             QMessageBox.critical(self, "Save failed", str(e))
             return
 
         self.current_path = Path(path)
+        if cross_format:
+            self.model = model_to_save
         self._imported_from_signmatrix = False
         self._new_from_scratch = False
         self._confirmed_save_paths.add(str(self.current_path))
@@ -3520,7 +4070,7 @@ finally {
     def _snapshot_state(self):
         if not self.model:
             return None
-        return {
+        snapshot = {
             "glyphs": [bytearray(g) for g in self.model.glyphs],
             "spacing": self.model.spacing,
             "glyph_index": self.canvas.glyph_index,
@@ -3530,6 +4080,9 @@ finally {
             "height": self.model.height,
             "bytes_per_col": self.model.bytes_per_col,
         }
+        if isinstance(self.model, HanoverFont):
+            snapshot["advance_widths"] = list(self.model.advance_widths)
+        return snapshot
 
     def _restore_snapshot(self, snap):
         if not self.model or snap is None:
@@ -3543,6 +4096,8 @@ finally {
             self.model.count = snap["count"]
             self.model.height = snap["height"]
             self.model.bytes_per_col = snap["bytes_per_col"]
+            if isinstance(self.model, HanoverFont):
+                self.model.advance_widths = list(snap["advance_widths"])
 
             idx = max(0, min(snap["glyph_index"], len(self.model.glyphs) - 1))
             self.canvas.glyph_index = idx
