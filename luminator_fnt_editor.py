@@ -311,6 +311,80 @@ class LuminatorFont:
         return obj
 
     @classmethod
+    def from_mie(cls, path):
+        """Import a Luminator MIE FNT as an editable legacy FNT model."""
+        path = Path(path)
+        raw = path.read_bytes()
+        if len(raw) < 100 or raw[:2] != b"\x00\x03":
+            raise ValueError("File does not have the supported Luminator MIE FNT signature.")
+
+        try:
+            # The copyright text may consume a variable amount of its reserved
+            # space, but MIE's structural header fields remain fixed.
+            height = int.from_bytes(raw[87:89], "big")
+            spacing = raw[94]
+            first = raw[95]
+            last = raw[96]
+            table_start = 148
+        except IndexError as e:
+            raise ValueError("MIE FNT header is incomplete.") from e
+
+        if not (1 <= height <= 32 and first <= last):
+            raise ValueError("MIE FNT header has an unsupported glyph range or height.")
+
+        count = last - first + 1
+        table_end = table_start + count * 6
+        if table_end > len(raw):
+            raise ValueError("MIE FNT glyph directory runs past end of file.")
+
+        records = [
+            (
+                int.from_bytes(raw[offset:offset + 2], "little"),
+                int.from_bytes(raw[offset + 2:offset + 6], "little"),
+            )
+            for offset in range(table_start, table_end, 6)
+        ]
+        offsets = [offset for _width, offset in records]
+        if any(offsets[index] > offsets[index + 1] for index in range(count - 1)):
+            raise ValueError("MIE FNT glyph offsets are not monotonically increasing.")
+        if offsets[0] < table_end or offsets[0] > len(raw):
+            raise ValueError("MIE FNT first glyph offset is outside the file.")
+
+        obj = cls.create_blank(f"MIE {path.stem}", height, spacing, first, last, 1)
+        obj.path = path
+        obj.raw = raw
+        obj.glyphs = []
+
+        # MIE stores horizontal bitmap rows in 8-column planes: all rows for
+        # columns 0..7 come first, followed by all rows for columns 8..15.
+        # Bits are most-significant first. Convert to packed vertical columns.
+        for code, (width, offset) in enumerate(records, first):
+            width = max(1, width)
+            row_bytes = (width + 7) // 8
+            glyph_size = height * row_bytes
+            if offset + glyph_size > len(raw):
+                raise ValueError(f"MIE FNT glyph {code:#x} points outside the file.")
+
+            glyph = bytearray(width * obj.bytes_per_col)
+            obj.glyphs.append(glyph)
+            glyph_index = len(obj.glyphs) - 1
+            for y in range(height):
+                for x in range(width):
+                    source_byte = raw[offset + (x // 8) * height + y]
+                    if source_byte & (0x80 >> (x % 8)):
+                        obj.set_pixel(glyph_index, x, y, True)
+
+        obj.mie_source_path = path
+        obj.mie_table_gap = raw[table_end:offsets[0]]
+        obj.mie_zero_width_indices = {
+            index for index, (width, _offset) in enumerate(records) if width == 0
+        }
+        last_width, last_offset = records[-1]
+        last_size = height * ((max(1, last_width) + 7) // 8)
+        obj.mie_suffix = raw[last_offset + last_size:]
+        return obj
+
+    @classmethod
     def from_signmatrix(cls, json_path):
         json_path = Path(json_path)
 
@@ -710,6 +784,59 @@ class LuminatorFont:
             out += blob
 
         Path(path).write_bytes(out)
+
+    def save_mie(self, path):
+        """Save an imported MIE font using its original header as a template."""
+        if not getattr(self, "mie_source_path", None) or self.raw[:2] != b"\x00\x03":
+            raise ValueError("MIE saving is available only for fonts imported from MIE.")
+        if len(self.raw) < 148:
+            raise ValueError("MIE source header is incomplete.")
+        if len(self.glyphs) != self.count:
+            raise ValueError("MIE glyph count does not match the character range.")
+
+        max_width = max((self.width(index) for index in range(self.count)), default=0)
+        if max_width > 0xFFFF:
+            raise ValueError("An MIE glyph cannot be wider than 65535 pixels.")
+
+        header = bytearray(self.raw[:148])
+        header[87:89] = self.height.to_bytes(2, "big")
+        header[92:94] = max_width.to_bytes(2, "big")
+        header[94] = self.spacing & 0xFF
+        header[95] = self.first & 0xFF
+        header[96] = self.last & 0xFF
+
+        table_gap = getattr(self, "mie_table_gap", b"")
+        offset = 148 + self.count * 6 + len(table_gap)
+        directory = bytearray()
+        payload = bytearray()
+        for index in range(self.count):
+            width = self.width(index)
+            encoded_width = (
+                0
+                if index in getattr(self, "mie_zero_width_indices", set())
+                and width == 1
+                else width
+            )
+            # Zero-width MIE records still reserve one blank bitmap plane.
+            # The editor represents that plane as a one-column blank glyph.
+            row_bytes = (width + 7) // 8
+            bitmap = bytearray(self.height * row_bytes)
+            for y in range(self.height):
+                for x in range(width):
+                    if self.pixel(index, x, y):
+                        bitmap[(x // 8) * self.height + y] |= 0x80 >> (x % 8)
+
+            directory += encoded_width.to_bytes(2, "little")
+            directory += offset.to_bytes(4, "little")
+            payload += bitmap
+            offset += len(bitmap)
+
+        if offset > 0xFFFF:
+            raise ValueError("MIE glyph data is too large for its 16-bit endpoint field.")
+        header[2:4] = offset.to_bytes(2, "little")
+        Path(path).write_bytes(
+            header + directory + table_gap + payload + getattr(self, "mie_suffix", b"")
+        )
 
 
 class HanoverFont:
@@ -1439,12 +1566,13 @@ def bbm_cp437_display_labels(first, count):
 class MainWindow(QMainWindow):
     SOURCE_FORMATS = (
         ("Luminator (.FNT)", "luminator"),
+        ("MIE (.FNT)", "mie"),
         ("Hanover (.FNT)", "hanover"),
         ("Axion (.BBM)", "bbm"),
         ("SignMatrix (.JSON+.PNG)", "signmatrix"),
     )
     TARGET_FORMATS = tuple(
-        item for item in SOURCE_FORMATS if item[1] != "bbm"
+        item for item in SOURCE_FORMATS if item[1] not in {"bbm", "mie"}
     )
 
     def __init__(self):
@@ -1496,6 +1624,7 @@ class MainWindow(QMainWindow):
         open_menu.addAction(
             "Luminator (.FNT)", lambda: self.open_file("luminator")
         )
+        open_menu.addAction("MIE (.FNT)", lambda: self.open_file("mie"))
         open_menu.addAction(
             "Hanover (.FNT)", lambda: self.open_file("hanover")
         )
@@ -1527,6 +1656,7 @@ class MainWindow(QMainWindow):
         save_as_menu.addAction(
             "Luminator (.FNT)", lambda: self.save_as("luminator")
         )
+        save_as_menu.addAction("MIE (.FNT)", lambda: self.save_as("mie"))
         save_as_menu.addAction(
             "Hanover (.FNT)", lambda: self.save_as("hanover")
         )
@@ -3545,6 +3675,7 @@ finally {
     def open_file(self, format_hint=None):
         filters = {
             "luminator": "Luminator (.FNT) (*.fnt);;All files (*.*)",
+            "mie": "MIE (.FNT) (*.fnt);;All files (*.*)",
             "hanover": "Hanover (.FNT) (*.fnt);;All files (*.*)",
             "bbm": "Axion (.BBM) (*.BBM *.bbm);;All files (*.*)",
             "signmatrix": "SignMatrix (.JSON+.PNG) (*.json);;All files (*.*)",
@@ -3580,17 +3711,23 @@ finally {
             self.model = (
                 LuminatorFont.from_bbm(path, custom_order=custom_order)
                 if is_bbm else HanoverFont(path)
-                if format_hint == "hanover" else LuminatorFont(path)
+                if format_hint == "hanover" else LuminatorFont.from_mie(path)
+                if format_hint == "mie" or source_path.read_bytes()[:2] == b"\x00\x03"
+                else LuminatorFont(path)
             )
         except Exception as e:
             QMessageBox.critical(self, "Cannot open font", str(e))
             return
 
         self.current_path = source_path.with_suffix(".fnt") if is_bbm else source_path
-        self._imported_from_signmatrix = is_bbm
+        self._imported_from_signmatrix = is_bbm or format_hint == "mie" or hasattr(
+            self.model, "mie_source_path"
+        )
         self._new_from_scratch = False
         if is_bbm:
             label = f"{source_path.name} (BBM import)"
+        elif format_hint == "mie" or hasattr(self.model, "mie_source_path"):
+            label = f"{self.current_path.name} (MIE import)"
         elif format_hint == "hanover":
             label = f"{self.current_path.name} (Hanover)"
         else:
@@ -3598,13 +3735,15 @@ finally {
         self._load_model_into_editor(label)
         message = (
             f"Imported {source_path.name}; use Save As to create an FNT"
-            if is_bbm else f"Opened {self.current_path.name}"
+            if is_bbm or hasattr(self.model, "mie_source_path")
+            else f"Opened {self.current_path.name}"
         )
         self.statusBar().showMessage(message, 5000 if is_bbm else 0)
 
     def _batch_file_filter(self, source_format):
         return {
             "luminator": "Luminator (.FNT) (*.fnt)",
+            "mie": "MIE (.FNT) (*.fnt)",
             "hanover": "Hanover (.FNT) (*.fnt)",
             "bbm": "Axion (.BBM) (*.BBM *.bbm)",
             "signmatrix": "SignMatrix (.JSON+.PNG) (*.json)",
@@ -3613,6 +3752,8 @@ finally {
     def _load_batch_source(self, path, source_format):
         if source_format == "luminator":
             return LuminatorFont(path)
+        if source_format == "mie":
+            return LuminatorFont.from_mie(path)
         if source_format == "hanover":
             return HanoverFont(path)
         if source_format == "bbm":
@@ -3797,7 +3938,12 @@ finally {
             self.save_as()
             return
 
-        if isinstance(self.model, LuminatorFont) and not self._confirm_luminator_omissions():
+        is_mie = hasattr(self.model, "mie_source_path")
+        if (
+            isinstance(self.model, LuminatorFont)
+            and not is_mie
+            and not self._confirm_luminator_omissions()
+        ):
             return
 
         path_key = str(self.current_path)
@@ -3814,7 +3960,10 @@ finally {
             self._confirmed_save_paths.add(path_key)
 
         try:
-            self.model.save(str(self.current_path))
+            if is_mie:
+                self.model.save_mie(str(self.current_path))
+            else:
+                self.model.save(str(self.current_path))
         except Exception as e:
             QMessageBox.critical(self, "Save failed", str(e))
             return
@@ -3835,7 +3984,19 @@ finally {
             return
 
         if format_hint is None:
-            format_hint = "hanover" if isinstance(self.model, HanoverFont) else "luminator"
+            format_hint = (
+                "hanover" if isinstance(self.model, HanoverFont)
+                else "mie" if hasattr(self.model, "mie_source_path")
+                else "luminator"
+            )
+
+        if format_hint == "mie" and not hasattr(self.model, "mie_source_path"):
+            QMessageBox.warning(
+                self,
+                "Cannot save as MIE",
+                "MIE saving is available only for fonts imported from MIE.",
+            )
+            return
 
         expected_model = HanoverFont if format_hint == "hanover" else LuminatorFont
         cross_format = not isinstance(self.model, expected_model)
@@ -3855,6 +4016,7 @@ finally {
             "Save font as",
             default_path,
             "FNT (Hanover) (*.fnt)" if format_hint == "hanover"
+            else "FNT (MIE) (*.fnt)" if format_hint == "mie"
             else "FNT (Luminator) (*.fnt)"
         )
         if not path:
@@ -3872,7 +4034,10 @@ finally {
                 self._convert_model_for_fnt(format_hint)
                 if cross_format else self.model
             )
-            model_to_save.save(path)
+            if format_hint == "mie":
+                model_to_save.save_mie(path)
+            else:
+                model_to_save.save(path)
         except Exception as e:
             QMessageBox.critical(self, "Save failed", str(e))
             return

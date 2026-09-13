@@ -1,15 +1,15 @@
 # Luminator FNT Editor
 
-A Windows editor for Luminator IPS bitmap font (`.fnt`) files. As of v1.1.0, Hanover HELEN bitmap font (`.fnt`) and Axion DataTransit bitmap font (`.bbm`) are also supported.
+A Windows editor for Luminator IPS bitmap font (`.fnt`) files. As of v1.2.0, Luminator MIE bitmap font (`.fnt`), Hanover HELEN bitmap font (`.fnt`) and Axion DataTransit bitmap font (`.bbm`) are also supported.
 
 This project was created through reverse engineering of font files used by Luminator IPS.
 
 ## Features
 
-- Import bitmap fonts from Luminator `.fnt`, Hanover `.fnt`, Axion `.bbm`, and [SignMatrix](https://github.com/itzzmarkus/Signmatrix) `.json` + `.png`
-- Export bitmap fonts as Luminator `.fnt`, Hanover `.fnt`, and [SignMatrix](https://github.com/itzzmarkus/Signmatrix) `.json` + `.png`; Exporting to Axion `.bbm` is not supported
-- Exported fonts can be imported back to Luminator IPS or Hanover HELEN
-- Create new Luminator `.fnt` from scratch
+- Open and edit Luminator IPS, Luminator MIE, and Hanover `.fnt` files; import Axion `.bbm` and [SignMatrix](https://github.com/itzzmarkus/Signmatrix) `.json` + `.png`
+- Save Luminator IPS, Luminator MIE (only from MIE imports), and Hanover `.fnt` files; export [SignMatrix](https://github.com/itzzmarkus/Signmatrix) `.json` + `.png`
+- Exported Luminator IPS and Hanover fonts can be imported back to Luminator IPS or Hanover HELEN
+- Create new Luminator IPS `.fnt` files from scratch
 - Pixel-level glyph editor
 - Extract embedded `.fnt` files from Luminator IPS databases (`.ips`); Requires a compatible Microsoft Access database provider
 (ACE or Jet) to be installed on Windows
@@ -17,8 +17,8 @@ This project was created through reverse engineering of font files used by Lumin
 
 ## Format Information
 
-### Luminator FNT
-The Luminator `.fnt` format is a proprietary bitmap font format and is not the standard Microsoft Windows FNT format. The format has been reverse engineered from existing Luminator font files.
+### Legacy Luminator IPS FNT
+The legacy Luminator IPS `.fnt` format is a proprietary bitmap font format and is not the standard Microsoft Windows FNT format. It is distinct from the newer Luminator MIE `.fnt` format below. The format has been reverse engineered from existing Luminator IPS font files.
 
 Known characteristics include:
 
@@ -31,6 +31,20 @@ Known characteristics include:
 - Multi-byte vertical columns for fonts taller than 8 pixels
 
 Some parts of the format may still be undocumented.
+
+### Luminator MIE FNT
+Luminator MIE `.fnt` files are a newer proprietary Luminator bitmap font format and are not interchangeable with legacy Luminator IPS `.fnt` files or standard Microsoft Windows FNT files.
+
+Known characteristics include:
+
+- `00 03` file signature and a 148-byte binary header
+- Font height, maximum glyph width, global inter-character spacing, and first and last character codes in the header
+- Variable-width glyph records containing a 16-bit little-endian width and a 32-bit little-endian absolute bitmap offset
+- Bitmap rows grouped into 8-column planes, with most-significant-bit-first pixels
+- Optional zero-width glyph records that still reserve a blank bitmap plane
+- Format-specific data between the glyph directory and bitmap data, plus an optional trailing data block
+
+The editor opens MIE files through **Open > MIE (.FNT)**; files with the MIE signature are also detected automatically. Imported MIE fonts can be edited and saved as native MIE `.fnt` files. An unchanged open/save round trip preserves the supplied MIE files byte-for-byte. Native MIE saving is available for fonts imported from MIE; conversion from other font formats to newly synthesized MIE files is not currently supported.
 
 ### Hanover FNT
 The Hanover `.fnt` format are a proprietary text-based bitmap font format and are not standard Microsoft Windows FNT files. The fonts use Windows-1252 character labels from `0x20` through `0xFF`.
